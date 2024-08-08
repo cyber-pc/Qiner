@@ -1,6 +1,7 @@
 #define AVX512 0
 #define PORT 21841
 #define EPOCH 0
+#define DEBUG_SCORE 0
 
 #include <intrin.h>
 #include <stdio.h>
@@ -2328,10 +2329,20 @@ struct Miner
 
         memset(&neurons, 0, sizeof(neurons));
 
+#if DEBUG_SCORE
+        // This debug only feasible for testing one thread
+        static int count = 0;
+        for (int i = 0; i < 32; i++)
+        {
+            nonce[i] = i + count;
+        }
+        count++;
+#else
         _rdrand64_step((unsigned long long*) & nonce[0]);
         _rdrand64_step((unsigned long long*) & nonce[8]);
         _rdrand64_step((unsigned long long*) & nonce[16]);
         _rdrand64_step((unsigned long long*) & nonce[24]);
+#endif
         random(computorPublicKey, nonce, (unsigned char*)&synapses, sizeof(synapses));
         for (unsigned int inputNeuronIndex = 0; inputNeuronIndex < NUMBER_OF_INPUT_NEURONS + DATA_LENGTH; inputNeuronIndex++)
         {
@@ -2393,6 +2404,7 @@ struct Miner
                 score++;
             }
         }
+        printf("Score: %d\n", score);
 
         return (score >= (DATA_LENGTH / 2) + SOLUTION_THRESHOLD) || (score <= (DATA_LENGTH / 2) - SOLUTION_THRESHOLD);
     }
@@ -2617,7 +2629,7 @@ int main(int argc, char* argv[])
                 {
                     SYSTEMTIME systemTime;
                     GetSystemTime(&systemTime);
-                    printf("|   %d-%d%d-%d%d %d%d:%d%d:%d%d   |   %d it/s   |   %d solutions   |   %.10s...   |\n", systemTime.wYear, systemTime.wMonth / 10, systemTime.wMonth % 10, systemTime.wDay / 10, systemTime.wDay % 10, systemTime.wHour / 10, systemTime.wHour % 10, systemTime.wMinute / 10, systemTime.wMinute % 10, systemTime.wSecond / 10, systemTime.wSecond % 10, (numberOfMiningIterations - prevNumberOfMiningIterations) * 1000 / delta, numberOfFoundSolutions, argv[2]);
+                    //printf("|   %d-%d%d-%d%d %d%d:%d%d:%d%d   |   %d it/s   |   %d solutions   |   %.10s...   |\n", systemTime.wYear, systemTime.wMonth / 10, systemTime.wMonth % 10, systemTime.wDay / 10, systemTime.wDay % 10, systemTime.wHour / 10, systemTime.wHour % 10, systemTime.wMinute / 10, systemTime.wMinute % 10, systemTime.wSecond / 10, systemTime.wSecond % 10, (numberOfMiningIterations - prevNumberOfMiningIterations) * 1000 / delta, numberOfFoundSolutions, argv[2]);
                     prevNumberOfMiningIterations = numberOfMiningIterations;
                     timestamp = GetTickCount64();
                 }
