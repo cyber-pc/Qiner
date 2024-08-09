@@ -33,7 +33,7 @@ else()
 endif()
 
 # Main executable
-add_executable(${PROJECT_NAME} Qiner.cpp)
+add_executable(${PROJECT_NAME} src/Qiner.cpp)
 
 # Linking
 if(WIN32)
