@@ -1,6 +1,5 @@
 #define PORT 21841
 #define EPOCH 0
-#define DEBUG_SCORE 0
 
 #include <chrono>
 #include <thread>
@@ -2342,21 +2341,10 @@ struct Miner
     bool findSolution(unsigned char nonce[32])
     {
         memset(&neurons, 0, sizeof(neurons));
-
-#if DEBUG_SCORE
-        // This debug only feasible for testing one thread
-        static int count = 0;
-        for (int i = 0; i < 32; i++)
-        {
-            nonce[i] = i + count;
-        }
-        count++;
-#else
         _rdrand64_step((unsigned long long*) & nonce[0]);
         _rdrand64_step((unsigned long long*) & nonce[8]);
         _rdrand64_step((unsigned long long*) & nonce[16]);
         _rdrand64_step((unsigned long long*) & nonce[24]);
-#endif
         random(computorPublicKey, nonce, (unsigned char*)&synapses, sizeof(synapses));
         for (unsigned int inputNeuronIndex = 0; inputNeuronIndex < NUMBER_OF_INPUT_NEURONS + DATA_LENGTH; inputNeuronIndex++)
         {
@@ -2418,7 +2406,6 @@ struct Miner
                 score++;
             }
         }
-        printf("Score: %d\n", score);
 
         return (score >= (DATA_LENGTH / 2) + SOLUTION_THRESHOLD) || (score <= (DATA_LENGTH / 2) - SOLUTION_THRESHOLD);
     }
@@ -2428,7 +2415,7 @@ static std::atomic<char> state(0);
 
 static unsigned char computorPublicKey[32];
 static std::atomic<long long> numberOfMiningIterations(0);
-static unsigned int numberOfFoundSolutions = 0;
+static std::atomic<unsigned int> numberOfFoundSolutions(0);
 static std::queue<std::array<unsigned char, 32>> foundNonce;
 std::mutex foundNonceLock;
 
@@ -2772,9 +2759,9 @@ int main(int argc, char* argv[])
                     // Get current time in UTC
                     std::time_t now_time = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
                     std::tm* utc_time = std::gmtime(&now_time);
-                    //printf("|   %04d-%02d-%02d %02d:%02d:%02d   |   %llu it/s   |   %d solutions   |   %.10s...   |\n",
-                    //   utc_time->tm_year + 1900, utc_time->tm_mon, utc_time->tm_mday, utc_time->tm_hour, utc_time->tm_min, utc_time->tm_sec,
-                    //   (numberOfMiningIterations - prevNumberOfMiningIterations) * 1000 / delta, numberOfFoundSolutions, argv[2]);
+                    printf("|   %04d-%02d-%02d %02d:%02d:%02d   |   %llu it/s   |   %d solutions   |   %.10s...   |\n",
+                      utc_time->tm_year + 1900, utc_time->tm_mon, utc_time->tm_mday, utc_time->tm_hour, utc_time->tm_min, utc_time->tm_sec,
+                      (numberOfMiningIterations - prevNumberOfMiningIterations) * 1000 / delta, numberOfFoundSolutions.load(), argv[2]);
                     prevNumberOfMiningIterations = numberOfMiningIterations;
                     timestamp = std::chrono::steady_clock::now();
                 }
