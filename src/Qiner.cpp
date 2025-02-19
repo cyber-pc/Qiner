@@ -7,6 +7,7 @@
 #include <queue>
 #include <atomic>
 #include <vector>
+#include <iostream>
 #ifdef _MSC_VER
 #include <intrin.h>
 #include <winsock2.h>
@@ -21,8 +22,41 @@
 
 #endif
 
+#include "RequestResponseHeader.h"
+#include "RelayMessage.h"
 #include "K12AndKeyUtil.h"
 #include "keyUtils.h"
+
+
+class Job
+{
+public:
+    static constexpr const size_t kMaxBlobSize = 408;
+    static constexpr const size_t kMaxSeedSize = 32;
+
+    uint32_t m_algorithm;
+    bool m_nicehash     = false;
+    uint32_t m_seed[64];
+    size_t m_size       = 0;
+    uint32_t m_backend  = 0;
+    uint64_t m_diff     = 0;
+    uint64_t m_height   = 0;
+    uint64_t m_target   = 0;
+    uint8_t m_blob[kMaxBlobSize]{ 0 };
+    uint8_t m_index     = 0;
+
+    uint8_t m_ephPublicKey[32]{};
+    uint8_t m_ephSecretKey[32]{};
+
+    bool m_hasMinerSignature = false;
+};
+
+class JobMessage
+{
+public:
+    unsigned long long _index;
+    Job _job;
+};
 
 
 void random(unsigned char* publicKey, unsigned char* nonce, unsigned char* output, unsigned int outputSize)
@@ -70,67 +104,6 @@ void random2(unsigned char* publicKey, unsigned char* nonce, unsigned char* outp
     }
 }
 
-struct RequestResponseHeader
-{
-private:
-    unsigned char _size[3];
-    unsigned char _type;
-    unsigned int _dejavu;
-
-public:
-    inline unsigned int size()
-    {
-        return (*((unsigned int*)_size)) & 0xFFFFFF;
-    }
-
-    inline void setSize(unsigned int size)
-    {
-        _size[0] = (unsigned char)size;
-        _size[1] = (unsigned char)(size >> 8);
-        _size[2] = (unsigned char)(size >> 16);
-    }
-
-    inline bool isDejavuZero() const
-    {
-        return !_dejavu;
-    }
-
-    inline void zeroDejavu()
-    {
-        _dejavu = 0;
-    }
-
-
-    inline unsigned int dejavu() const
-    {
-        return _dejavu;
-    }
-
-    inline void setDejavu(unsigned int dejavu)
-    {
-        _dejavu = dejavu;
-    }
-
-    inline void randomizeDejavu()
-    {
-        _rdrand32_step(&_dejavu);
-        if (!_dejavu)
-        {
-            _dejavu = 1;
-        }
-    }
-
-    inline unsigned char type() const
-    {
-        return _type;
-    }
-
-    inline void setType(const unsigned char type)
-    {
-        _type = type;
-    }
-};
-
 #define BROADCAST_MESSAGE 1
 
 typedef struct
@@ -140,8 +113,9 @@ typedef struct
     unsigned char gammingNonce[32];
 } Message;
 
-char* nodeIp = NULL;
-int nodePort = 0;
+char* gNodeIp = NULL;
+int gNodePort = 0;
+
 static constexpr unsigned long long DATA_LENGTH = 256;
 static constexpr unsigned long long NUMBER_OF_HIDDEN_NEURONS = 3000;
 static constexpr unsigned long long NUMBER_OF_NEIGHBOR_NEURONS = 3000;
@@ -430,8 +404,9 @@ int miningThreadProc()
     return 0;
 }
 
-struct ServerSocket
+class ServerSocket
 {
+public:
 #ifdef _MSC_VER
     ServerSocket()
     {
@@ -449,7 +424,7 @@ struct ServerSocket
         closesocket(serverSocket);
     }
 
-    bool establishConnection(char* address)
+    bool establishConnection(char* address, int nodePortCustom)
     {
         serverSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (serverSocket == INVALID_SOCKET)
@@ -461,7 +436,7 @@ struct ServerSocket
         sockaddr_in addr;
         ZeroMemory(&addr, sizeof(addr));
         addr.sin_family = AF_INET;
-        addr.sin_port = htons(nodePort);
+        addr.sin_port = htons(nodePortCustom);
         sscanf_s(address, "%hhu.%hhu.%hhu.%hhu", &addr.sin_addr.S_un.S_un_b.s_b1, &addr.sin_addr.S_un.S_un_b.s_b2, &addr.sin_addr.S_un.S_un_b.s_b3, &addr.sin_addr.S_un.S_un_b.s_b4);
         if (connect(serverSocket, (const sockaddr*)&addr, sizeof(addr)))
         {
@@ -479,8 +454,9 @@ struct ServerSocket
     {
         close(serverSocket);
     }
-    bool establishConnection(char* address)
+    bool establishConnection(const char* address, int nodePortCustom = -1)
     {
+        int port = nodePortCustom > 0 ? nodePortCustom : gNodePort;
         serverSocket = socket(AF_INET, SOCK_STREAM, 0);
         if (serverSocket == -1)
         {
@@ -491,7 +467,7 @@ struct ServerSocket
         sockaddr_in addr;
         memset(&addr, 0, sizeof(addr));
         addr.sin_family = AF_INET;
-        addr.sin_port = htons(nodePort);
+        addr.sin_port = htons(port);
         if (inet_pton(AF_INET, address, &addr.sin_addr) <= 0)
         {
             printf("Invalid address/ Address not supported (%s)\n", address);
@@ -553,8 +529,401 @@ static void hexToByte(const char* hex, uint8_t* byte, const int sizeInByte)
     }
 }
 
+constexpr int MESSAGE_TYPE_SOLUTION = 0;
+constexpr int MESSAGE_TYPE_CUSTOM_MINING_TASK = 1;
+constexpr int MESSAGE_TYPE_CUSTOM_MINING_SOLUTION = 2;
+
+std::queue<JobMessage> jobsQueue;
+std::mutex jobsQueueMtx;
+
+enum TaskThreadId
+{
+    ARB_TASK_SERVER = 0, // thread that waiting for task from xmrig
+    ARB_TASK_DISPATCHER = 1, // thread distribute the task to the node
+    ARB_TASK_TRACKER = 2, // thread track/log the task dispatching status
+    MAX_THREAD,
+};
+
+
+class CustomMiningTaskMessage
+{
+
+public:
+    CustomMiningTaskMessage() = default;
+
+    RequestResponseHeader header;
+    Message message;
+    // Payload
+    std::vector<char> payload;
+
+    unsigned char signature[64];
+
+    size_t serialize(char* buffer) const
+    {
+        memcpy(buffer, &header, sizeof(RequestResponseHeader));
+        memcpy(buffer + sizeof(RequestResponseHeader), (char*)&message, sizeof(message));
+        memcpy(buffer + sizeof(RequestResponseHeader) + sizeof(message) , (char*)&payload[0], payload.size());
+        memcpy(buffer + sizeof(RequestResponseHeader) + sizeof(message) + payload.size(), signature, sizeof(signature));
+
+        return getTotalSizeInBytes();
+    }
+
+    size_t getTotalSizeInBytes() const
+    {
+        return sizeof(RequestResponseHeader) + sizeof(message) + sizeof(signature) + payload.size();
+    }
+};
+
+int craftTaskMessage(
+    const unsigned char* signingSubseed,
+    const unsigned char* signingPublicKey,
+    const JobMessage& jobBuffer,
+    CustomMiningTaskMessage& taskMessage)
+{
+    // Payload
+    taskMessage.payload.resize(sizeof(Job) + 8);
+    // First 8 bytes of payload are used as task index
+    memcpy(&taskMessage.payload[0], (char*)&jobBuffer._index, 8);
+    memcpy(&taskMessage.payload[8], (char*)&jobBuffer._job, sizeof(Job));
+
+    // Header
+    taskMessage.header.setSize(taskMessage.getTotalSizeInBytes());
+    taskMessage.header.zeroDejavu();
+    taskMessage.header.setType(BROADCAST_MESSAGE);
+
+    memcpy(taskMessage.message.sourcePublicKey, signingPublicKey, sizeof(taskMessage.message.sourcePublicKey));
+
+    // Zero destination is used for custom mining
+    memset(taskMessage.message.destinationPublicKey, 0, sizeof(taskMessage.message.destinationPublicKey));
+
+    unsigned char sharedKeyAndGammingNonce[64];
+    // Default behavior when provided seed is just a signing address
+    // first 32 bytes of sharedKeyAndGammingNonce is set as zeros
+    memset(sharedKeyAndGammingNonce, 0, 32);
+
+    // Last 32 bytes of sharedKeyAndGammingNonce is randomly created so that gammingKey[0] = MESSAGE_TYPE_CUSTOM_MINING_TASK
+    unsigned char gammingKey[32];
+    do
+    {
+        _rdrand64_step((unsigned long long*) & taskMessage.message.gammingNonce[0]);
+        _rdrand64_step((unsigned long long*) & taskMessage.message.gammingNonce[8]);
+        _rdrand64_step((unsigned long long*) & taskMessage.message.gammingNonce[16]);
+        _rdrand64_step((unsigned long long*) & taskMessage.message.gammingNonce[24]);
+        memcpy(&sharedKeyAndGammingNonce[32], taskMessage.message.gammingNonce, 32);
+        KangarooTwelve(sharedKeyAndGammingNonce, 64, gammingKey, 32);
+    }
+    while (gammingKey[0] != MESSAGE_TYPE_CUSTOM_MINING_TASK);
+
+    // Encrypt the message payload
+    std::vector<unsigned char> gamma(taskMessage.payload.size());
+    KangarooTwelve(gammingKey, sizeof(gammingKey), &gamma[0], gamma.size());
+    for (unsigned int i = 0; i < gamma.size(); i++)
+    {
+        taskMessage.payload[i] = taskMessage.payload[i] ^ gamma[i];
+    }
+
+    // Sign the message
+    uint8_t digest[32] = {0};
+    uint8_t signature[64] = {0};
+    KangarooTwelve(
+        (unsigned char*)&taskMessage.payload[0],
+        taskMessage.payload.size(),
+        digest,
+        32);
+    sign(signingSubseed, signingPublicKey, digest, signature);
+    memcpy(taskMessage.signature, signature, 64);
+
+    return 0;
+}
+
+size_t gTotalDispatchedTasks = 0;
+int taskDispatcherThread(const char* signingSeed, const char* nodeip, int port)
+{
+    // Data for signing the the monero task
+    unsigned char signingPrivateKey[32];
+    unsigned char signingSubseed[32];
+    unsigned char signingPublicKey[32];
+    getSubseedFromSeed((unsigned char*)signingSeed, signingSubseed);
+    getPrivateKeyFromSubSeed(signingSubseed, signingPrivateKey);
+    getPublicKeyFromPrivateKey(signingPrivateKey, signingPublicKey);
+
+    char publicIdentity[128] = {0};
+    getIdentityFromPublicKey(signingPublicKey, publicIdentity, false);
+
+    ServerSocket serverSocket;
+    bool haveTask = false;
+    std::vector<char> serializedData;
+    while (!state)
+    {
+        bool haveTask = false;
+        JobMessage jobBuffer;
+        {
+            std::lock_guard<std::mutex> lock(jobsQueueMtx);
+            haveTask = jobsQueue.size() > 0;
+            if (haveTask)
+            {
+                jobBuffer = jobsQueue.front();
+            }
+        }
+
+        if (haveTask)
+        {
+            if (serverSocket.establishConnection(nodeip, port))
+            {
+                // Craft the task message
+                CustomMiningTaskMessage taskMessage;
+                craftTaskMessage(signingSubseed, signingPublicKey, jobBuffer, taskMessage);
+
+                // Send the job to node
+                serializedData.resize(taskMessage.getTotalSizeInBytes());
+                taskMessage.serialize(&serializedData[0]);
+
+                if (serverSocket.sendData((char*)&serializedData[0], serializedData.size()))
+                {
+                    std::lock_guard<std::mutex> lock(jobsQueueMtx);
+                    // Send job successfully. Remove it from the queue
+                    jobsQueue.pop();
+                    gTotalDispatchedTasks++;
+                }
+                serverSocket.closeConnection();
+            }
+        }
+    }
+
+    return 0;
+}
+
+int taskReceiverThread(int port)
+{
+    int server_fd, moneroSocket;
+    sockaddr_in address;
+    int addrlen = sizeof(address);
+
+    // Create socket
+    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
+        perror("Socket failed");
+        return -1;
+    }
+
+    // Bind address
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(port);
+    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+        perror("Bind failed");
+        return -1;
+    }
+
+    // Listen for connection
+    if (listen(server_fd, 3) < 0) {
+        perror("Listen failed");
+        return -1;
+    }
+
+    std::cout << "Waiting for a connection ... at port " << port << std::endl;
+
+    // Listenning to task from xmrig
+    bool connectionFailure = false;
+    while (!state)
+    {
+        // Accept new connection
+        moneroSocket = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen);
+        if (moneroSocket < 0)
+        {
+            perror("Accept failed");
+            continue;
+        }
+        std::cout<< "Client connected!" << std::endl;
+
+        bool reconnectFlag = false;
+        while (!state)
+        {
+            // Receive task
+            RelayMessage relayMessage;
+
+            // Receive the fixed-size header safely
+            int totalHeaderReceived = 0;
+            while (totalHeaderReceived < sizeof(RequestResponseHeader))
+            {
+                int chunk = recv(moneroSocket, (char*)&relayMessage.header + totalHeaderReceived,
+                                sizeof(RequestResponseHeader) - totalHeaderReceived, 0);
+                if (chunk <= 0)
+                {
+                    std::cerr << "Client disconnected or error while receiving header.\n";
+                    reconnectFlag = true;
+                    break;
+                }
+                totalHeaderReceived += chunk;
+            }
+
+            if (connectionFailure || reconnectFlag)
+            {
+                break;
+            }
+
+            // Process payload
+            if (!reconnectFlag)
+            {
+                // Get payload size from the header
+                size_t payloadSize = relayMessage.header.size() - sizeof(RequestResponseHeader);
+
+                if (payloadSize != sizeof(Job))
+                {
+                    std::cout << "Mismatched data size! (size =  " << payloadSize << " vs " << sizeof(Job) << std::endl;
+                    continue;
+                }
+
+                // Receive the payload
+                relayMessage.payload.resize(payloadSize);
+                std::fill(relayMessage.payload.begin(), relayMessage.payload.end(), 0);
+                size_t totalReceived = 0;
+                while (totalReceived < payloadSize)
+                {
+                    int chunk = recv(moneroSocket, &relayMessage.payload[0] + totalReceived, payloadSize - totalReceived, 0);
+                    if (chunk <= 0)
+                    {
+                        std::cerr << "Client disconnected or error while receiving payload.\n";
+                        reconnectFlag = true;
+                        break;
+                    }
+                    totalReceived += chunk;
+                }
+
+                // Connection failed. Exitting
+                if (connectionFailure)
+                {
+                    break;
+                }
+
+                // Enqueue the job
+                if (!reconnectFlag)
+                {
+                    JobMessage jobBuffer;
+                    memcpy((char*)&jobBuffer._job, &relayMessage.payload[0], relayMessage.payload.size());
+
+                    std::lock_guard<std::mutex> lock(jobsQueueMtx);
+                    jobBuffer._index = jobsQueue.size();
+                    jobsQueue.push(jobBuffer);
+                }
+            }
+
+            if (connectionFailure || reconnectFlag)
+            {
+                break;
+            }
+        }
+
+        if (connectionFailure)
+        {
+            break;
+        }
+
+        if (reconnectFlag)
+        {
+            std::cout << "Reconnecting ..." << std::endl;
+            close(moneroSocket);
+            reconnectFlag = false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10000));
+        }
+    }
+    close(server_fd);
+
+    return 0;
+}
+
+int taskTrackerThread()
+{
+    while (!state)
+    {
+        size_t remainedJob = 0;
+        size_t dispatchedTasks = 0;
+        {
+            std::lock_guard<std::mutex> lock(jobsQueueMtx);
+            remainedJob = jobsQueue.size();
+            dispatchedTasks = gTotalDispatchedTasks;
+        }
+        std::cout << "Dispatched jobs: remained(" << remainedJob << "), total (" << dispatchedTasks << ")" << std::endl;
+        std::this_thread::sleep_for(std::chrono::duration < double, std::milli>(5000));
+    }
+
+    return 0;
+}
+
 int main(int argc, char* argv[])
 {
+    std::string mode;
+    int serverPort = 0;
+    int nodePort = 0;
+    std::string nodeIP;
+    std::string dispatcherSeed;
+    for (int i = 1; i < argc; ++i)
+    {
+        std::string arg = argv[i];
+
+        // Check for specific arguments
+        if (arg == "--mode")
+        {
+            mode = argv[++i];
+        }
+        else if (arg == "--port")
+        {
+            serverPort = std::stoi(argv[++i]);
+        }
+        else if (arg == "--nodeport")
+        {
+            nodePort = std::stoi(argv[++i]);
+        }
+        else if (arg == "--nodeip")
+        {
+            nodeIP = argv[++i];
+        }
+        else if (arg == "--seed")
+        {
+            dispatcherSeed = argv[++i];
+        }
+        else
+        {
+            std::cout << "Unknown argument: " << arg << "\n";
+        }
+    }
+    std::cout << "- mode: " << mode << std::endl
+              << "- serverPort: " << serverPort << std::endl
+              << "- nodeip: " << nodeIP << std::endl
+              << "- nodeport: " << nodePort << std::endl;
+
+    std::vector<std::unique_ptr<std::thread>> taskThreads(MAX_THREAD);
+
+    consoleCtrlHandler();
+
+    // Dispatcher mode
+    if (mode == "dispatcher")
+    {
+        // Launch thread listen to tasks from Monero network
+        taskThreads[ARB_TASK_SERVER].reset(new std::thread(taskReceiverThread, serverPort));
+
+        // Launch thread submit job to node
+        taskThreads[ARB_TASK_DISPATCHER].reset(new std::thread(taskDispatcherThread, dispatcherSeed.c_str(), nodeIP.c_str(), nodePort));
+
+        taskThreads[ARB_TASK_TRACKER].reset(new std::thread(taskTrackerThread));
+    }
+
+
+    // Wait for all threads to join
+    for (auto& t : taskThreads)
+    {
+        if (nullptr == t)
+        {
+            continue;
+        }
+        if (t->joinable())
+        {
+            t->join();
+        }
+    }
+    printf("Qiner is shut down.\n");
+
+
+    return 0;
     std::vector<std::thread> miningThreads;
     if (argc != 7)
     {
@@ -562,10 +931,10 @@ int main(int argc, char* argv[])
     }
     else
     {
-        nodeIp = argv[1];
-        nodePort = std::atoi(argv[2]);
+        gNodeIp = argv[1];
+        gNodePort = std::atoi(argv[2]);
         char* miningID = argv[3];
-        printf("Qiner is launched. Connecting to %s:%d\n", nodeIp, nodePort);
+        printf("Qiner is launched. Connecting to %s:%d\n", gNodeIp, gNodePort);
 
         consoleCtrlHandler();
 
@@ -614,7 +983,7 @@ int main(int argc, char* argv[])
                 }
                 if (haveNonceToSend)
                 {
-                    if (serverSocket.establishConnection(nodeIp))
+                    if (serverSocket.establishConnection(gNodeIp))
                     {
                         struct
                         {
