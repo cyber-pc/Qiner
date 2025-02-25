@@ -19,7 +19,10 @@ else()
 endif()
 
 # Main executable
-add_executable(${PROJECT_NAME} src/Qiner.cpp src/keyUtils.cpp)
+add_executable(${PROJECT_NAME}
+    src/Dispatcher.cpp
+    src/Qiner.cpp
+    src/keyUtils.cpp)
 
 include_directories(${PROJECT_NAME} ./src)
 
