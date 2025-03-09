@@ -1,6 +1,6 @@
 #pragma once
 
-#include "CustomTask.h"
+#include "CustomMining.h"
 
 #include <atomic>
 #include <mutex>
@@ -18,6 +18,8 @@ public:
     void stop();
 
     // Launch the dispatcher thread that constantly send the job to network or send to a specific nodeip:port
+    // This function also can simulate the dispatcher that broadcast the custom message so we don't need to wait
+    // for message from node
     int launchDispatcherThread(const char* signingSeed, const char* nodeip, int port);
 
     // Launch the dispatcher thread that constantly listen to the XMR jobs

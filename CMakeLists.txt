@@ -22,6 +22,7 @@ endif()
 add_executable(${PROJECT_NAME}
     src/Dispatcher.cpp
     src/Qiner.cpp
+    src/PoolOperator.cpp
     src/keyUtils.cpp)
 
 include_directories(${PROJECT_NAME} ./src)

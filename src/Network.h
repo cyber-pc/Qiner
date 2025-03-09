@@ -143,3 +143,99 @@ public:
         return numberOfBytes;
     }
 };
+
+class ServerSocket2
+{
+public:
+    ServerSocket2(int port, bool nonBlocking = false)
+    {
+        _nonBlockingMode = nonBlocking;
+        _port = port;
+        _connectionSts = 0;
+        int addrlen = sizeof(_address);
+
+        // Create socket
+        if ((_serverFd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
+            perror("Socket failed");
+            _connectionSts = -1;
+        }
+
+        int opt = 1;
+        setsockopt(_serverFd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+        // Bind address
+        _address.sin_family = AF_INET;
+        _address.sin_addr.s_addr = INADDR_ANY;
+        _address.sin_port = htons(_port);
+        if (bind(_serverFd, (struct sockaddr *)&_address, sizeof(_address)) < 0)
+        {
+            perror("Bind failed");
+            _connectionSts = -1;
+        }
+    }
+
+    ~ServerSocket2()
+    {
+        closeConnection();
+    }
+
+    // Listen for connection
+    int listenForConnection(int maxConnection = 5)
+    {
+        if (listen(_serverFd, maxConnection) < 0)
+        {
+            perror("Listen failed");
+            _connectionSts = -1;
+            return -1;
+        }
+
+        std::cout << "Waiting for a connection ... at port " << _port << std::endl;
+        return 0;
+    }
+
+    int acceptConnection()
+    {
+        _serverSocket = accept(_serverFd, (struct sockaddr *)&_address, (socklen_t*)&_address);
+        if (_serverSocket < 0)
+        {
+            perror("Accept failed");
+        }
+
+        return _serverSocket;
+    }
+
+    int receiveData(char* data, size_t dataSize)
+    {
+        return recv(_serverSocket, data, dataSize, 0);
+    }
+
+    int sendData(char* data, size_t dataSize)
+    {
+        return send(_serverSocket, data, dataSize, 0);
+    }
+
+    void closeSocket()
+    {
+        if (_serverSocket > 0)
+        {
+            close(_serverSocket);
+        }
+    }
+
+    void closeConnection()
+    {
+        closeSocket();
+        if (_serverFd > 0)
+        {
+            close(_serverFd);
+        }
+    }
+
+private:
+    int _port;
+    int _serverFd;
+    sockaddr_in _address;
+    int _serverSocket;
+    int _connectionSts;
+    bool _nonBlockingMode;
+};

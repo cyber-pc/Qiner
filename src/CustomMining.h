@@ -43,9 +43,9 @@ public:
     unsigned long long _taskIndex;
 
     unsigned char _blob[MAX_BLOB_SIZE]; // Job data from pool
-    unsigned long long _size;     // length of the blob
-    unsigned long long _target;             // Pool difficulty
-    unsigned long long _height;             // Block height
+    unsigned long long _size;           // length of the blob
+    unsigned long long _target;         // Pool difficulty
+    unsigned long long _height;         // Block height
     unsigned char _seed[MAX_SEED_SIZE]; // Seed hash for XMR
 
     unsigned int _extraNonce;
@@ -87,4 +87,67 @@ struct TaskQueueMessage
 {
     unsigned long long _taskCount;
     char _taskQueueBuffer[1024U * CUSTOM_MINING_PAYLOAD_SIZE];
+};
+
+class CustomSolution
+{
+public:
+
+    unsigned long long _taskIndex;
+    unsigned int nonce;         // xmrig::JobResult.nonce
+    unsigned char result[32];   // xmrig::JobResult.result
+};
+
+class CustomMiningSolutionMessage
+{
+
+public:
+    CustomMiningSolutionMessage() = default;
+
+    RequestResponseHeader _header;
+
+    unsigned char _sourcePublicKey[32];
+    unsigned char _destinationPublicKey[32];
+    unsigned char _gammingNonce[32];
+    CustomSolution _solution;
+
+    unsigned char _signature[SIGNATURE_SIZE];
+
+    size_t serialize(char* buffer) const
+    {
+        memcpy(buffer, this, getTotalSizeInBytes());
+        return getTotalSizeInBytes();
+    }
+
+    size_t getTotalSizeInBytes() const
+    {
+        return sizeof(CustomMiningSolutionMessage);
+    }
+    size_t getPayLoadSize() const
+    {
+        return sizeof(CustomMiningSolutionMessage) - sizeof(_header) - sizeof(_signature);
+    }
+};
+
+
+// Message from pool operator to miner
+// This is the dummy code for testing the full flow
+class OperatorTaskMessage
+{
+public:
+    OperatorTaskMessage() = default;
+    RequestResponseHeader _header;
+
+    CustomTask _task;
+    unsigned long long int minerID;
+};
+
+class OperatorSolutionMessage
+{
+public:
+    OperatorSolutionMessage() = default;
+    RequestResponseHeader _header;
+
+    CustomSolution _solution;
+    unsigned long long int minerID;
 };
