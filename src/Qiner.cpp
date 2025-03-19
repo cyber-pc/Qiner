@@ -155,7 +155,7 @@ int getSystemProcs()
     return 0;
 }
 
-void printCustomMiningMessage(const CustomMiningTaskMessage& message)
+void printCustomMiningTaskMessage(const CustomMiningTaskMessage& message)
 {
     char hexStr[128] = {0};
     char publicIdentity[128] = {0};
@@ -164,8 +164,8 @@ void printCustomMiningMessage(const CustomMiningTaskMessage& message)
     getIdentityFromPublicKey(message._sourcePublicKey, publicIdentity, false);
     if (std::strcmp(DISPATCHER, publicIdentity) == 0)
     {
-        std::cout << "[OK] DISPATCHER ID " << publicIdentity << std::endl;
-        std::cout << "[OK] DISPATCHER PublicKey " << hexStr << std::endl;
+        std::cout << "[OK] DISPATCHER ID: " << publicIdentity << std::endl;
+        std::cout << "[OK] DISPATCHER PublicKey: " << hexStr << std::endl;
     }
     else
     {
@@ -177,7 +177,7 @@ void printCustomMiningMessage(const CustomMiningTaskMessage& message)
     getIdentityFromPublicKey(message._destinationPublicKey, publicIdentity, false);
     if (isZeros<32>(message._destinationPublicKey))
     {
-        std::cout << "[OK] Zeros dest ID " << publicIdentity << std::endl;
+        std::cout << "[OK] Zeros dest ID: " << publicIdentity << std::endl;
     }
     else
     {
@@ -185,23 +185,64 @@ void printCustomMiningMessage(const CustomMiningTaskMessage& message)
         return;
     }
 
+    // Signature
+    memset(hexStr, 0, sizeof(hexStr));
+    byteToHex(message._signature, hexStr, 64);
+    std::cout  << "Signature: " << hexStr << std::endl;
+
     // Task info
     CustomTask task = message._task;
-    std::cout  << "Task index " << task._taskIndex << std::endl;
-    std::cout  << "Target  " << task._target << std::endl;
-    std::cout  << "Height " << task._height << std::endl;
-    std::cout  << "ExtraNonce " << task._extraNonce << std::endl;
+    std::cout  << "Task index: " << task._taskIndex << std::endl;
+    std::cout  << "Target:  " << task._target << std::endl;
+    std::cout  << "Height: " << task._height << std::endl;
+    std::cout  << "ExtraNonce: " << task._extraNonce << std::endl;
     memset(hexStr, 0, sizeof(hexStr));
     byteToHex(task._seed, hexStr, 32);
-    std::cout  << "Seed hash " << hexStr << std::endl;
+    std::cout  << "Seed hash: " << hexStr << std::endl;
 }
 
-int readFetchingTaskBinary(const char* fileName)
+void printCustomMiningSolMessage(const CustomMiningSolutionMessage& message)
+{
+    char hexStr[128] = {0};
+    char publicIdentity[128] = {0};
+    memset(hexStr, 0, sizeof(hexStr));
+    byteToHex(message._sourcePublicKey, hexStr, 32);
+    getIdentityFromPublicKey(message._sourcePublicKey, publicIdentity, false);
+    std::cout << "COMPUTOR ID: " << publicIdentity << std::endl;
+    std::cout << "COMPUTOR PublicKey: " << hexStr << std::endl;
+
+    //
+    getIdentityFromPublicKey(message._destinationPublicKey, publicIdentity, false);
+    if (isZeros<32>(message._destinationPublicKey))
+    {
+        std::cout << "Zeros dest ID " << publicIdentity << std::endl;
+    }
+    else
+    {
+        std::cout << "[FAILED] Zeros dest ID: " << publicIdentity << std::endl;
+        return;
+    }
+
+    // Signature
+    memset(hexStr, 0, sizeof(hexStr));
+    byteToHex(message._signature, hexStr, 64);
+    std::cout  << "Signature: " << hexStr << std::endl;
+
+    // Task info
+    CustomSolution solution = message._solution;
+    std::cout  << "Task index: " << solution._taskIndex << std::endl;
+    std::cout  << "Nonce: " << solution.nonce << std::endl;
+    memset(hexStr, 0, sizeof(hexStr));
+    byteToHex(solution.result, hexStr, 32);
+    std::cout  << "Result: " << hexStr << std::endl;
+
+}
+
+int readTaskBinaryMessage(const char* fileName)
 {
     // Read binary data for testing
     {
         CustomMiningTaskMessage message;
-        std::vector<char> serializedData(sizeof(CustomMiningTaskMessage));
 
         std::ifstream file(fileName, std::ios::binary);
         if (!file)
@@ -209,9 +250,38 @@ int readFetchingTaskBinary(const char* fileName)
             std::cerr << "Error opening file!\n";
             return -1;
         }
-        file.read(reinterpret_cast<char*>(&message) + sizeof(RequestResponseHeader), sizeof(CustomMiningTaskMessage) - sizeof(RequestResponseHeader));
+        file.read(reinterpret_cast<char*>(&message), sizeof(CustomMiningTaskMessage));
 
-        printCustomMiningMessage(message);
+        char hexStr[sizeof(CustomMiningTaskMessage) * 2 + 1];
+        byteToHex(reinterpret_cast<uint8_t*>(&message), hexStr, sizeof(CustomMiningTaskMessage));
+        std::cout << "Hex: " << hexStr << std::endl;
+        std::cout << "======================================" << std::endl;
+
+        printCustomMiningTaskMessage(message);
+    }
+    return 0;
+}
+
+int readSolutionBinaryMessage(const char* fileName)
+{
+    // Read binary data for testing
+    {
+        CustomMiningSolutionMessage message;
+
+        std::ifstream file(fileName, std::ios::binary);
+        if (!file)
+        {
+            std::cerr << "Error opening file!\n";
+            return -1;
+        }
+        file.read(reinterpret_cast<char*>(&message), sizeof(CustomMiningSolutionMessage));
+
+        char hexStr[sizeof(CustomMiningSolutionMessage) * 2 + 1];
+        byteToHex(reinterpret_cast<uint8_t*>(&message), hexStr, sizeof(CustomMiningSolutionMessage));
+        std::cout << "Hex: " << hexStr << std::endl;
+        std::cout << "======================================" << std::endl;
+
+        printCustomMiningSolMessage(message);
     }
     return 0;
 }
@@ -252,7 +322,7 @@ int main(int argc, char* argv[])
         {
             seed = argv[++i];
         }
-        else if (arg == "--bin")
+        else if (arg == "--file")
         {
             binFileName = argv[++i];
         }
@@ -292,10 +362,17 @@ int main(int argc, char* argv[])
         gPoolOperator.launchSolutionSubmitterThread(seed.c_str(), nodeIP.c_str(), nodePort);
 
     }
-    else if(mode == "bin")
+    else if(mode == "readtask")
     {
         // Read a binary file dumping from node and do analysis
-        readFetchingTaskBinary(binFileName.c_str());
+        readTaskBinaryMessage(binFileName.c_str());
+        return 0;
+    }
+    else if(mode == "readsol")
+    {
+        // Read a binary file dumping from node and do analysis
+        readSolutionBinaryMessage(binFileName.c_str());
+        return 0;
     }
 
     while (!state)
