@@ -94,3 +94,13 @@ void extract64Bits(unsigned long long number, char* output)
         output[i] = ((number >> i) & 1);
     }
 }
+
+template <unsigned long long bitCount>
+void toTenaryBits(long long A, char* bits)
+{
+    for (unsigned long long i = 0; i < bitCount; ++i)
+    {
+        long long bitValue = (A >> i) & 1;
+        bits[i] = (bitValue == 0) ? -1 : bitValue;
+    }
+}

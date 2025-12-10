@@ -21,7 +21,7 @@
 
 #endif
 
-#include "score_hyperidentity.h"
+#include "score_addition.h"
 #include "keyUtils.h"
 
 struct RequestResponseHeader
@@ -150,8 +150,15 @@ int getSystemProcs()
     return 0;
 }
 
-using namespace score_reference;
-typedef Miner<NUMBER_OF_INPUT_NEURONS, NUMBER_OF_OUTPUT_NEURONS, NUMBER_OF_TICKS, MAX_NEIGHBOR_NEURONS, POPULATION_THRESHOLD, NUMBER_OF_MUTATIONS, SOLUTION_THRESHOLD> ActiveMiner;
+using AdditionMiner = score_addition::Miner<
+    score_addition::NUMBER_OF_INPUT_NEURONS,
+    score_addition::NUMBER_OF_OUTPUT_NEURONS,
+    score_addition::NUMBER_OF_TICKS,
+    score_addition::MAX_NEIGHBOR_NEURONS,
+    score_addition::POPULATION_THRESHOLD,
+    score_addition::NUMBER_OF_MUTATIONS,
+    score_addition::SOLUTION_THRESHOLD>;
+using ActiveMiner = AdditionMiner;
 
 int miningThreadProc()
 {
