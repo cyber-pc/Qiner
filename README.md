@@ -1,6 +1,19 @@
 # Qubic Reference Miner
 This Repo contains the reference implementation of the algoritm used in Qubic.
 
+## Licensing
+
+This project is licensed under the **Anti-Military License**—see the `LICENSE` file for details.
+
+### Third-Party Licenses
+
+This project incorporates code from third-party sources which are governed by different licenses. Full compliance information, including the original copyright notices and terms for these dependencies, can be found in the **`NOTICE`** file in the repository root.
+
+## File structure
+- score_reference.h: Implements the mining and scoring logic, this should be a refenence code for miner and score verification.
+- Qiner.cpp: Contains the main process logic/functionality. Mainly show how to communicate with the node.
+- K12AndKeyUtill.h, keyUtils.h, keyUtils.cpp: Provide K12 and key conversion utilities/functions.
+
 # Requirement
 - CPU: support at least AVX2 instruction set
 - OS: Windows, Linux
