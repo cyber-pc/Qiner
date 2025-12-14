@@ -3,6 +3,7 @@
 #include "score_common.h"
 #include "K12AndKeyUtil.h"
 
+#include <cassert>
 #include <vector>
 
 namespace score_addition
@@ -831,7 +832,6 @@ struct Miner
 
         for (unsigned long long s = 0; s < numberOfMutations; ++s)
         {
-
             // Do the mutation
             mutate(s);
 
