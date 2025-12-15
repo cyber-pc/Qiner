@@ -88,7 +88,6 @@ T clampNeuron(T neuronValue)
 
 void extract64Bits(unsigned long long number, char* output)
 {
-    int count = 0;
     for (int i = 0; i < 64; ++i)
     {
         output[i] = ((number >> i) & 1);

@@ -16,7 +16,7 @@ static constexpr unsigned long long MAX_NEIGHBOR_NEURONS = 728;      // 2M. Must
 static constexpr unsigned long long NUMBER_OF_MUTATIONS = 100;
 static constexpr unsigned long long POPULATION_THRESHOLD =
     NUMBER_OF_INPUT_NEURONS + NUMBER_OF_OUTPUT_NEURONS + NUMBER_OF_MUTATIONS; // P
-static constexpr unsigned int SOLUTION_THRESHOLD = ((1ULL << NUMBER_OF_INPUT_NEURONS) * NUMBER_OF_OUTPUT_NEURONS * 4 / 5);;
+static constexpr unsigned int SOLUTION_THRESHOLD = ((1ULL << NUMBER_OF_INPUT_NEURONS) * NUMBER_OF_OUTPUT_NEURONS * 4 / 5);
 
 template <
     unsigned long long numberOfInputNeurons,  // K
@@ -874,4 +874,4 @@ struct Miner
     }
 };
 
-} // namespace score_reference
+} // namespace score_addition

@@ -267,7 +267,7 @@ TEST_CASE("bufferIndexAndOffset", "[conversion]")
 
     SECTION("Repeat: bufferIndex -> offset -> bufferIndex")
     {
-        for (long long idx = 0; idx < MAX_NEIGHBOR_NEURONS; idx++)
+        for (long long idx = 0; idx < TEST_MAX_NUMBER_OF_NEIGHBORS; idx++)
         {
             long long offset = fixture.miner->bufferIndexToOffset(idx);
             REQUIRE(offset != 0); // Never returns 0 because we exclude self neuron
