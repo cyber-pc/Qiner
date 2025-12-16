@@ -151,6 +151,23 @@ int getSystemProcs()
     return 0;
 }
 
+struct Stat
+{
+    std::atomic<unsigned long long> totalAdditionNonce;
+    std::atomic<unsigned long long> totalHyperIdentityNonce;
+    std::atomic<unsigned long long> totalHyperIdentitySols;
+    std::atomic<unsigned long long> totalAdditionSols;
+
+    Stat()
+    {
+        totalAdditionNonce.store(0);
+        totalHyperIdentityNonce.store(0);
+        totalHyperIdentitySols.store(0);
+        totalAdditionSols.store(0);
+    }
+
+} qinerStat;
+
 using AdditionMiner = score_addition::Miner<
     score_addition::NUMBER_OF_INPUT_NEURONS,
     score_addition::NUMBER_OF_OUTPUT_NEURONS,
@@ -185,15 +202,27 @@ int miningThreadProc()
         _rdrand64_step((unsigned long long*)&nonce.data()[24]);
 
         bool solutionFound = false;
-        
+
         // First byte of nonce is used for determine type of score
         if ((nonce[0] & 1) == 0)
         {
             solutionFound = hyperIdentityMiner->findSolution(computorPublicKey, nonce.data());
+            // Stats
+            qinerStat.totalHyperIdentityNonce.fetch_add(1);
+            if (solutionFound)
+            {
+                qinerStat.totalHyperIdentitySols.fetch_add(1);
+            }
         }
         else
         {
             solutionFound = additionMiner->findSolution(computorPublicKey, nonce.data());
+            // Stats
+            qinerStat.totalAdditionNonce.fetch_add(1);
+            if (solutionFound)
+            {
+                qinerStat.totalAdditionSols.fetch_add(1);
+            }
         }
 
         if (solutionFound)
@@ -491,6 +520,11 @@ int main(int argc, char* argv[])
                 miningTh.join();
             }
         }
+
+        // Print stats
+        printf("Hyperidentity sols / nonces: %llu / %llu \n", qinerStat.totalHyperIdentitySols.load(), qinerStat.totalHyperIdentityNonce.load());
+        printf("Addition sols / nonces: %llu / %llu \n", qinerStat.totalAdditionSols.load(), qinerStat.totalAdditionNonce.load());
+
         printf("Qiner is shut down.\n");
     }
 
