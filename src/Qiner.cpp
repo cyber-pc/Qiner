@@ -21,6 +21,7 @@
 
 #endif
 
+#include "score_hyperidentity.h"
 #include "score_addition.h"
 #include "keyUtils.h"
 
@@ -158,12 +159,22 @@ using AdditionMiner = score_addition::Miner<
     score_addition::POPULATION_THRESHOLD,
     score_addition::NUMBER_OF_MUTATIONS,
     score_addition::SOLUTION_THRESHOLD>;
-using ActiveMiner = AdditionMiner;
+using HyperIdentityMiner = score_hyberidentity::Miner<
+    score_hyberidentity::NUMBER_OF_INPUT_NEURONS,
+    score_hyberidentity::NUMBER_OF_OUTPUT_NEURONS,
+    score_hyberidentity::NUMBER_OF_TICKS,
+    score_hyberidentity::MAX_NEIGHBOR_NEURONS,
+    score_hyberidentity::POPULATION_THRESHOLD,
+    score_hyberidentity::NUMBER_OF_MUTATIONS,
+    score_hyberidentity::SOLUTION_THRESHOLD>;
 
 int miningThreadProc()
 {
-    std::unique_ptr<ActiveMiner> miner(new ActiveMiner());
-    miner->initialize(randomSeed);
+    std::unique_ptr<AdditionMiner> additionMiner(new AdditionMiner());
+    additionMiner->initialize(randomSeed);
+
+    std::unique_ptr<HyperIdentityMiner> hyperIdentityMiner(new HyperIdentityMiner());
+    hyperIdentityMiner->initialize(randomSeed);
 
     std::array<unsigned char, 32> nonce;
     while (!state)
@@ -173,7 +184,19 @@ int miningThreadProc()
         _rdrand64_step((unsigned long long*)&nonce.data()[16]);
         _rdrand64_step((unsigned long long*)&nonce.data()[24]);
 
-        if (miner->findSolution(computorPublicKey, nonce.data()))
+        bool solutionFound = false;
+        
+        // First byte of nonce is used for determine type of score
+        if ((nonce[0] & 1) == 0)
+        {
+            solutionFound = hyperIdentityMiner->findSolution(computorPublicKey, nonce.data());
+        }
+        else
+        {
+            solutionFound = additionMiner->findSolution(computorPublicKey, nonce.data());
+        }
+
+        if (solutionFound)
         {
             {
                 std::lock_guard<std::mutex> guard(foundNonceLock);
