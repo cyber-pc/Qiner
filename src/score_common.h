@@ -40,10 +40,10 @@ void random2(
         x[i] = ((unsigned int*)seed)[i];
     }
 
-    for (int j = 0; j < segments; j++)
+    for (unsigned long long j = 0; j < segments; j++)
     {
         // Each segment will have 8 elements. Each element have 8 bytes
-        for (int i = 0; i < 8; i++)
+        for (unsigned long long i = 0; i < 8; i++)
         {
             unsigned int base = (x[i] >> 3) >> 3;
             unsigned int m = x[i] & 63;
@@ -72,7 +72,7 @@ void random2(
 
 // Clamp the neuron value
 template <typename T>
-T clampNeuron(T neuronValue)
+char clampNeuron(T neuronValue)
 {
     if (neuronValue > 1)
     {
@@ -83,7 +83,7 @@ T clampNeuron(T neuronValue)
     {
         return -1;
     }
-    return neuronValue;
+    return static_cast<char>(neuronValue);
 }
 
 void extract64Bits(unsigned long long number, char* output)
