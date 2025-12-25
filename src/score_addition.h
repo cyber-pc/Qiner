@@ -459,7 +459,7 @@ struct Miner
             if (delta < 0)
             {
                 // Left side is kept as it is, only need to shift to the right side
-                for (long long k = (long long)newEndSynapseBufferIdx - 1; k > insertedNeuronIdxInNeigborList; --k)
+                for (long long k = (long long)newEndSynapseBufferIdx - 1; k >= insertedNeuronIdxInNeigborList; --k)
                 {
                     // Updated synapse
                     pUpdatedSynapses[k] = pUpdatedSynapses[k - 1];
