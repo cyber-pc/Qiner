@@ -845,7 +845,7 @@ struct Miner
             unsigned int R = inferANN();
 
             // Roll back if neccessary
-            if (R > bestR)
+            if (R >= bestR)
             {
                 bestR = R;
                 // Better R. Save the state
