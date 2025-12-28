@@ -38,3 +38,4 @@ endif()
 
 # Other projects
 add_subdirectory(test)
+add_subdirectory(tools)

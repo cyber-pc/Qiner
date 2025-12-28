@@ -731,8 +731,8 @@ struct Miner
         return R;
     }
 
-    // Main function for mining
-    bool findSolution(unsigned char* publicKey, unsigned char* nonce)
+    // Compute score function
+    unsigned int computeScore(unsigned char* publicKey, unsigned char* nonce)
     {
         // Initialize
         unsigned int bestR = initializeANN(publicKey, nonce);
@@ -772,6 +772,14 @@ struct Miner
 
         // Check score
         unsigned int score = numberOfOutputNeurons - bestR;
+        return score;
+    }
+
+    // Main function for mining
+    bool findSolution(unsigned char* publicKey, unsigned char* nonce)
+    {
+        // Check score
+        unsigned int score = computeScore(publicKey, nonce);
         if (score >= solutionThreshold)
         {
             return true;
