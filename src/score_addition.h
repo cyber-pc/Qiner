@@ -6,6 +6,11 @@
 #include <cassert>
 #include <vector>
 
+// LUT-based Addition.
+// Every neuron holds a trit and computes its next value by looking up a per-neuron table indexed by the trits of
+// a set of neighbours on the ring, only the LUT contents change under mutation.
+//
+// Trit values are {0, 1, 2} where 0 and 1 are the two decided states and 2 means UNKNOWN.
 namespace score_addition
 {
 
@@ -13,18 +18,20 @@ static constexpr unsigned long long NUMBER_OF_INPUT_NEURONS = 2 * 7; // K
 static constexpr unsigned long long NUMBER_OF_OUTPUT_NEURONS = 8;    // L
 static constexpr unsigned long long NUMBER_OF_TICKS = 120;
 static constexpr unsigned long long NUMBER_OF_MUTATIONS = 100;
-// Fixed-topology detour: total neuron count is set directly.
-static constexpr unsigned long long POPULATION_THRESHOLD = 32;                  // P
-// Buffer is sized to N. Effective neighbor count clamps to N-1 (self excluded)
-// inside getActualNeighborCount(), keeps maxNumberOfNeighbors even and the existing buffer-center math intact.
-static constexpr unsigned long long MAX_NEIGHBOR_NEURONS = POPULATION_THRESHOLD;
+static constexpr unsigned long long POPULATION_THRESHOLD = 256;      // P
+// The neighbour offsets that feed every neuron's LUT, in LUT-index order
+static constexpr long long NEIGHBOR_OFFSETS[] = { 1, 5, 47 };
+static constexpr unsigned long long MAX_NEIGHBOR_NEURONS =
+    sizeof(NEIGHBOR_OFFSETS) / sizeof(NEIGHBOR_OFFSETS[0]);
 static constexpr unsigned int SOLUTION_THRESHOLD = ((1ULL << NUMBER_OF_INPUT_NEURONS) * NUMBER_OF_OUTPUT_NEURONS * 4 / 5);
+// Max LUT entries one mutation step may use (miner-chosen L)
+static constexpr unsigned int MAX_LUT_ENTRIES_PER_STEP = 10;
 
 template <
     unsigned long long numberOfInputNeurons,  // K
     unsigned long long numberOfOutputNeurons, // L
     unsigned long long numberOfTicks,         // N
-    unsigned long long maxNumberOfNeighbors,  // 2M
+    unsigned long long maxNumberOfNeighbors,  // LUT fan-in (neighbours read per neuron)
     unsigned long long populationThreshold,   // P
     unsigned long long numberOfMutations,     // S
     unsigned int solutionThreshold>
@@ -35,43 +42,115 @@ struct Miner
     static constexpr unsigned long long maxNumberOfNeurons = populationThreshold;
     static constexpr unsigned long long numberOfEvolutionNeurons =
         populationThreshold - numberOfNeurons;   // P - K - L
-    static constexpr unsigned long long maxNumberOfSynapses =
-        populationThreshold * maxNumberOfNeighbors;
-    static constexpr unsigned long long trainingSetSize = 1ULL << numberOfInputNeurons; // 2^K
-    static constexpr unsigned long long paddingNumberOfSynapses =
-        (maxNumberOfSynapses + 31 ) / 32 * 32; // padding to multiple of 32
-    // Packed 2-bit synapse storage: 4 weights per byte. Encoding:
-    //   00 -> 0, 01 -> +1, 10 -> -1, 11 -> 0
-    static constexpr unsigned long long packedSynapsesBytes = (maxNumberOfSynapses + 3) / 4;
+    // Half of the 2^K possible pairs are graded each epoch (chosen from the epoch-start spectrum digest).
+    static constexpr unsigned long long trainingSetSize = (1ULL << numberOfInputNeurons) / 2; // 2^(K-1)
+    static constexpr unsigned long long fullTrainingSetSize = trainingSetSize * 2; // 2^K total possible pairs
+
+    // Undecided trit (the third value); the two decided states are 0 and 1.
+    static constexpr unsigned char TRIT_UNKNOWN = 2;
+
+    // Error counts of one evaluation: FALSE = decided wrong, UNKNOWN = output left at trit 2.
+    struct Score
+    {
+        unsigned int numberOfFalses;
+        unsigned int numberOfUnknowns;
+    };
+
+    // Compare two error scores by total error count (fewer is better).
+    // Returns 1 if (1) is worse, -1 if better, 0 if equal.
+    static int compare(unsigned int numberOfFalses1, unsigned int numberOfUnknowns1, unsigned int numberOfFalses2, unsigned int numberOfUnknowns2)
+    {
+        const unsigned int total1 = numberOfFalses1 + numberOfUnknowns1;
+        const unsigned int total2 = numberOfFalses2 + numberOfUnknowns2;
+        if (total1 > total2)
+        {
+            return 1;
+        }
+        if (total1 < total2)
+        {
+            return -1;
+        }
+        return 0;
+    }
+
+    // 3 trit inputs, 3^3 = 27 lines per LUT (one output trit per neighbour-trit combination).
+    static constexpr unsigned long long lutSize = 27;
 
     static_assert(
-        maxNumberOfSynapses <= (0xFFFFFFFFFFFFFFFF << 1ULL),
-        "maxNumberOfSynapses must less than or equal MAX_UINT64/2");
-    static_assert(maxNumberOfNeighbors % 2 == 0, "maxNumberOfNeighbors must divided by 2");
+        maxNumberOfNeighbors == 3,
+        "the LUT index is hardcoded for 3 neighbours");
     static_assert(
         populationThreshold > numberOfNeurons,
         "populationThreshold must be greater than numberOfNeurons");
+    static_assert(
+        (populationThreshold & (populationThreshold - 1)) == 0,
+        "populationThreshold must be a power of 2");
+    static_assert(
+        maxNumberOfNeighbors == sizeof(NEIGHBOR_OFFSETS) / sizeof(NEIGHBOR_OFFSETS[0]),
+        "maxNumberOfNeighbors must equal the NEIGHBOR_OFFSETS table length");
 
     std::vector<unsigned char> poolVec;
 
-    void initialize(unsigned char miningSeed[32])
+    // The epoch-start Spectrum Digest is required; it selects the graded training subset.
+    void initialize(unsigned char miningSeed[32], const unsigned char epochStartSpectrumDigest[32])
     {
         // Init random2 pool with mining seed
         poolVec.resize(POOL_VEC_PADDING_SIZE);
         generateRandom2Pool(miningSeed, poolVec.data());
+
+        // Fixed neighbour wiring, computed once.
+        computeSourceNeurons();
+
+        // Generate the full sample, then select the subset from the Spectrum Digest.
+        generateFullTrainingSet();
+        setEpochStartSpectrumDigest(epochStartSpectrumDigest);
     }
 
-    // Training set
+    // Select the graded subset deterministically from the epoch-start Spectrum Digest
+    void setEpochStartSpectrumDigest(const unsigned char epochStartSpectrumDigest[32])
+    {
+        // One random from the digest fills the subset selection draws and the neuron placement.
+        random(epochStartSpectrumDigest, 32, (unsigned char*)&epochRandoms, sizeof(epochRandoms));
+
+        // Select trainingSetSize distinct samples from the full set.
+        for (unsigned long long i = 0; i < fullTrainingSetSize; ++i)
+        {
+            pairIndexPool[i] = (unsigned int)i;
+        }
+        for (unsigned long long k = 0; k < trainingSetSize; ++k)
+        {
+            const unsigned long long remaining = fullTrainingSetSize - k;
+            const unsigned long long j = epochRandoms.selectionRandoms[k] % remaining;
+
+            // Take pairIndexPool[j], remove it from the active range, copy that sample
+            const unsigned int pickedTrainingIndex = pairIndexPool[j];
+            // Swap the already pick to the tail to avoid duplicated selection
+            pairIndexPool[j] = pairIndexPool[remaining - 1];
+
+            trainingSet[k] = fullTrainingSet[pickedTrainingIndex];
+        }
+
+        // Neuron placement is fixed per epoch from the digest; compute it once here.
+        computeNeuronPlacement();
+    }
+
     struct TraningPair
     {
         char input[numberOfInputNeurons]; // numberOfInputNeurons / 2 bits of A , and B (values: -1 or +1)
         char output[numberOfOutputNeurons];  // numberOfOutputNeurons bits of C (values: -1 or +1)
-    } trainingSet[trainingSetSize];       // training set size: 2^K
-
-    struct Synapse
-    {
-        char weight;
     };
+    // All 2^K possible samples (generated once); trainingSet is the 2^(K-1) graded subset chosen per epoch.
+    TraningPair fullTrainingSet[fullTrainingSetSize];
+    TraningPair trainingSet[trainingSetSize];
+
+    // Per-epoch data from the spectrum digest
+    struct EpochRandoms
+    {
+        unsigned int selectionRandoms[trainingSetSize];
+        unsigned long long inputNeuronPositions[numberOfInputNeurons];
+        unsigned long long outputNeuronPositions[numberOfOutputNeurons];
+    } epochRandoms;
+    unsigned int pairIndexPool[fullTrainingSetSize];
 
     // Data for running the ANN
     struct Neuron
@@ -83,649 +162,235 @@ struct Miner
             kEvolution,
         };
         Type type;
-        char value;
-        bool markForRemoval;
+        unsigned char value; // trit in {0, 1, 2}
     };
 
-    // Data for roll back
+    // Data for roll back, mutation will change LUT output contents
     struct ANN
     {
         Neuron neurons[maxNumberOfNeurons];
-        unsigned char synapsesPacked[packedSynapsesBytes];
-        unsigned long long population;
+        unsigned char lut[maxNumberOfNeurons][lutSize];
     };
     ANN bestANN;
     ANN currentANN;
-
-    // Decoded synapse buffer (derived from currentANN.synapsesPacked).
-    Synapse synapses[maxNumberOfSynapses];
+    // Snapshot for the one-step rollback in the anti-attractor walk.
+    ANN prevANN;
 
     struct InitValue
     {
-        unsigned long long outputNeuronPositions[numberOfOutputNeurons];
-        unsigned long long evolutionNeuronPositions[numberOfEvolutionNeurons];
-        unsigned long long synapseWeight[paddingNumberOfSynapses / 32]; // each 64bits elements will
-                                                                        // decide value of 32 synapses
-        unsigned long long synapseMutation[numberOfMutations];
+        unsigned char lutInit[maxNumberOfNeurons * lutSize]; // one byte per LUT line, taken mod 3
+        unsigned long long mutationSeed[numberOfMutations * MAX_LUT_ENTRIES_PER_STEP];
     } initValue;
 
-    // Get the pointer to all outgoing synapses of a neuron.
-    Synapse* getSynapses(unsigned long long neuronIndex)
-    {
-        return &synapses[neuronIndex * maxNumberOfNeighbors];
-    }
-
-    // Refresh the decoded synapses[] buffer from currentANN.synapsesPacked.
-    void decodeSynapses()
-    {
-        // Encoding: 00 -> 0, 01 -> +1, 10 -> -1, 11 -> 0
-        static constexpr char weightFromBits[4] = { 0, +1, -1, 0 };
-        for (unsigned long long i = 0; i < maxNumberOfSynapses; ++i)
-        {
-            // Byte location: 4 weights per byte -> currentANN.synapsesPacked[i / 4]
-            // Slot location in byte: (i % 4) * 2
-            // Keep 2 bits: & 0x3U
-            unsigned char ev = (currentANN.synapsesPacked[i / 4] >> ((i % 4) * 2)) & 0x3U;
-            synapses[i].weight = weightFromBits[ev];
-        }
-    }
 
     unsigned long long neuronIndices[maxNumberOfNeurons];
-    char previousNeuronValue[maxNumberOfNeurons];
+    unsigned char nextNeuronValue[maxNumberOfNeurons];
+
+    // Fixed neighbour, source neuron index for each (neuron, slot)
+    unsigned long long sourceNeuron[maxNumberOfNeurons][maxNumberOfNeighbors];
 
     unsigned long long outputNeuronIndices[numberOfOutputNeurons];
-    char outputNeuronExpectedValue[numberOfOutputNeurons];
+    unsigned char outputNeuronExpectedValue[numberOfOutputNeurons];
 
-    long long neuronValueBuffer[maxNumberOfNeurons];
+    // Epoch-fixed neuron placement (input/output/evolution), computed once from the spectrum digest.
+    Neuron::Type neuronTypes[maxNumberOfNeurons];
 
-    unsigned long long getActualNeighborCount() const
+    // Indices of all non-input neurons (output + evolution), the only ones whose LUT is used
+    // and the only ones a mutation may touch. Filled in computeNeuronPlacement().
+    unsigned long long updatedNeuronIndices[maxNumberOfNeurons];
+    unsigned long long numberOfUpdatedNeurons;
+
+    // Map a bipolar training bit to a trit. The two decided states map to 0 and, the neutral maps to UNKNOWN.
+    static unsigned char bipolarToTrit(char val)
     {
-        unsigned long long population = currentANN.population;
-        unsigned long long maxNeighbors = population - 1;  // Exclude self
-        unsigned long long actual = std::min(maxNumberOfNeighbors, maxNeighbors);
-        
-        return actual;
-    }
-
-    unsigned long long getLeftNeighborCount() const
-    {
-        unsigned long long actual = getActualNeighborCount();
-        // For odd number, we add extra for the left
-        return (actual + 1) / 2;
-    }
-
-    unsigned long long getRightNeighborCount() const
-    {
-        return getActualNeighborCount() - getLeftNeighborCount();
-    }
-
-    // Get the starting index in synapse buffer (left side start)
-    unsigned long long getSynapseStartIndex() const
-    {
-        constexpr unsigned long long synapseBufferCenter = maxNumberOfNeighbors / 2;
-        return synapseBufferCenter - getLeftNeighborCount();
-    }
-
-    // Get the ending index in synapse buffer (exclusive)
-    unsigned long long getSynapseEndIndex() const
-    {
-        constexpr unsigned long long synapseBufferCenter = maxNumberOfNeighbors / 2;
-        return synapseBufferCenter + getRightNeighborCount();
-    }
-
-    // Convert buffer index to neighbor offset
-    long long bufferIndexToOffset(unsigned long long bufferIdx) const
-    {
-        constexpr long long synapseBufferCenter = maxNumberOfNeighbors / 2;
-        if (bufferIdx < synapseBufferCenter)
+        if (val < 0)
         {
-            return (long long)bufferIdx - synapseBufferCenter;  // Negative (left)
+            return 0;
         }
-        else
+        if (val > 0)
         {
-            return (long long)bufferIdx - synapseBufferCenter + 1;  // Positive (right), skip 0
+            return 1;
         }
+        return TRIT_UNKNOWN;
     }
 
-    // Convert neighbor offset to buffer index
-    long long offsetToBufferIndex(long long offset) const
+    // Precompute the fixed neighbour wiring: source neuron index for each (neuron, slot)
+    void computeSourceNeurons()
     {
-        constexpr long long synapseBufferCenter = maxNumberOfNeighbors / 2;
-        if (offset == 0)
+        for (unsigned long long n = 0; n < populationThreshold; ++n)
         {
-            return -1;  // Invalid, exclude self
-        }
-        else if (offset < 0)
-        {
-            return synapseBufferCenter + offset;
-        }
-        else
-        {
-            return synapseBufferCenter + offset - 1;
-        }
-    }
-
-    long long getIndexInSynapsesBuffer(long long neighborOffset) const
-    {
-        long long leftCount = (long long)getLeftNeighborCount();
-        long long rightCount = (long long)getRightNeighborCount();
-        
-        if (neighborOffset == 0 || 
-            neighborOffset < -leftCount || 
-            neighborOffset > rightCount)
-        {
-            return -1;
-        }
-
-        return offsetToBufferIndex(neighborOffset);
-    }
-
-
-
-    // Bit-flip mutation on the 2-bit packed weight encoding.
-    //   +1 (01) flipped on either bit -> 0 (00 or 11), never -1
-    //   -1 (10) flipped on either bit -> 0 (11 or 00), never +1
-    //   0  (00) -> +1 or -1 depending on which bit is flipped
-    //   0  (11) -> +1 or -1 depending on which bit is flipped (opposite of 00)
-    void mutate(unsigned long long synapseMutation)
-    {
-        // Seed split: bit 0 -> which of the 2 bits to flip; bits 1..63 -> synapse pick
-        unsigned long long population = currentANN.population;
-        unsigned long long actualNeighbors = getActualNeighborCount();
-
-        unsigned long long totalValidSynapses = population * actualNeighbors;
-        unsigned long long flatIdx = (synapseMutation >> 1) % totalValidSynapses;
-
-        unsigned long long neuronIdx = flatIdx / actualNeighbors;
-        unsigned long long localSynapseIdx = flatIdx % actualNeighbors;
-
-        unsigned long long synapseIndex = localSynapseIdx + getSynapseStartIndex();
-        unsigned long long synapseFullBufferIdx = neuronIdx * maxNumberOfNeighbors + synapseIndex;
-
-        // which of the 2 bits will be flipped
-        unsigned long long bitOffset = synapseMutation & 1ULL;
-        // byte location: 4 weights per byte
-        unsigned long long byteIdx = synapseFullBufferIdx / 4;
-        // which 2-bit slot in that byte (0..3)
-        unsigned long long nibblePos = synapseFullBufferIdx % 4;
-        // get mask to the set bit
-        unsigned char mask  = 1u << (nibblePos * 2 + bitOffset);
-        // flip the bit, others untouched
-        currentANN.synapsesPacked[byteIdx] ^= mask;
-    }
-
-    // Calculate the new neuron index that is reached by moving from the given `neuronIdx` `value`
-    // neurons to the right or left. Negative `value` moves to the left, positive `value` moves to
-    // the right. The return value is clamped in a ring buffer fashion, i.e. moving right of the
-    // rightmost neuron continues at the leftmost neuron.
-    unsigned long long clampNeuronIndex(long long neuronIdx, long long value)
-    {
-        unsigned long long population = currentANN.population;
-        assert(value > -(long long)population && value < (long long)population 
-           && "clampNeuronIndex: |value| must be less than population");
-
-        long long nnIndex = 0;
-        // Calculate the neuron index (ring structure)
-        if (value >= 0)
-        {
-            nnIndex = neuronIdx + value;
-        }
-        else
-        {
-            nnIndex = neuronIdx + population + value;
-        }
-        nnIndex = nnIndex % population;
-        return (unsigned long long)nnIndex;
-    }
-    
-
-    // Variable-topology helpers below are preserved (not compiled) for potential ant-colony
-    // reuse. Not used in fixed topology.
-#if 0
-    // Get the pointer to all outgoing synapse of a neurons
-    Synapse* getSynapses(unsigned long long neuronIndex)
-    {
-        return &currentANN.synapses[neuronIndex * maxNumberOfNeighbors];
-    }
-
-    // Remove a neuron and all synapses relate to it
-    void removeNeuron(unsigned long long neuronIdx)
-    {
-        long long leftCount = (long long)getLeftNeighborCount();
-        long long rightCount = (long long)getRightNeighborCount();
-        unsigned long long startSynapseBufferIdx = getSynapseStartIndex();
-        unsigned long long endSynapseBufferIdx = getSynapseEndIndex();
-
-        // Scan all its neighbor to remove their outgoing synapse point to the neuron
-        for (long long neighborOffset = -leftCount; neighborOffset <= rightCount; neighborOffset++)
-        {
-            if (neighborOffset == 0) continue;
-
-            unsigned long long nnIdx = clampNeuronIndex(neuronIdx, neighborOffset);
-            Synapse* pNNSynapses = getSynapses(nnIdx);
-
-            long long synapseIndexOfNN = getIndexInSynapsesBuffer(-neighborOffset);
-            if (synapseIndexOfNN < 0)
+            for (unsigned long long k = 0; k < maxNumberOfNeighbors; ++k)
             {
-                continue;
-            }
-
-            // The synapse array need to be shifted regard to the remove neuron
-            // Also neuron need to have 2M neighbors, the addtional synapse will be set as zero
-            // weight Case1 [S0 S1 S2 - SR S5 S6]. SR is removed, [S0 S1 S2 S5 S6 0] Case2 [S0 S1 SR
-            // - S3 S4 S5]. SR is removed, [0 S0 S1 S3 S4 S5]
-            constexpr unsigned long long halfMax = maxNumberOfNeighbors / 2;
-            if (synapseIndexOfNN >= (long long)halfMax)
-            {
-                for (long long k = synapseIndexOfNN; k < (long long)endSynapseBufferIdx - 1; ++k)
+                const long long value = NEIGHBOR_OFFSETS[k];
+                long long nnIndex = 0;
+                if (value >= 0)
                 {
-                    pNNSynapses[k] = pNNSynapses[k + 1];
+                    nnIndex = (long long)n + value;
                 }
-                pNNSynapses[endSynapseBufferIdx - 1].weight = 0;
-            }
-            else
-            {
-                for (long long k = synapseIndexOfNN; k > (long long)startSynapseBufferIdx; --k)
+                else
                 {
-                    pNNSynapses[k] = pNNSynapses[k - 1];
+                    nnIndex = (long long)n + (long long)populationThreshold + value;
                 }
-                pNNSynapses[startSynapseBufferIdx].weight = 0;
+                sourceNeuron[n][k] = (unsigned long long)(nnIndex % (long long)populationThreshold);
             }
         }
-
-        // Shift the synapse array and the neuron array
-        for (unsigned long long shiftIdx = neuronIdx; shiftIdx < currentANN.population - 1; shiftIdx++)
-        {
-            currentANN.neurons[shiftIdx] = currentANN.neurons[shiftIdx + 1];
-
-            // Also shift the synapses
-            memcpy(
-                getSynapses(shiftIdx),
-                getSynapses(shiftIdx + 1),
-                maxNumberOfNeighbors * sizeof(Synapse));
-        }
-        currentANN.population--;
     }
 
-    unsigned long long
-    getNeighborNeuronIndex(unsigned long long neuronIndex, unsigned long long neighborOffset)
+    // Neuron placement (input/output/evolution types) from the digest, computed once per epoch.
+    void computeNeuronPlacement()
     {
-        const unsigned long long leftNeighbors = getLeftNeighborCount();
-        unsigned long long nnIndex = 0;
-        if (neighborOffset < leftNeighbors)
+        for (unsigned long long i = 0; i < populationThreshold; ++i)
         {
-            nnIndex = clampNeuronIndex(
-                neuronIndex + neighborOffset, -(long long)leftNeighbors);
+            neuronIndices[i] = i;
+            neuronTypes[i] = Neuron::kEvolution;
         }
-        else
+        unsigned long long neuronCount = populationThreshold;
+
+        // Input positions from the remaining pool
+        for (unsigned long long i = 0; i < numberOfInputNeurons; ++i)
         {
-            nnIndex = clampNeuronIndex(
-                neuronIndex + neighborOffset + 1, -(long long)leftNeighbors);
-        }
-        return nnIndex;
-    }
-
-    void insertNeuron(unsigned long long neuronIndex, unsigned long long synapseIndex)
-    {
-        unsigned long long synapseFullBufferIdx = neuronIndex * maxNumberOfNeighbors + synapseIndex;
-        // Old value before insert neuron
-        unsigned long long oldStartSynapseBufferIdx = getSynapseStartIndex();
-        unsigned long long oldEndSynapseBufferIdx = getSynapseEndIndex();
-        unsigned long long oldActualNeighbors = getActualNeighborCount();
-        long long oldLeftCount = (long long)getLeftNeighborCount();
-        long long oldRightCount = (long long)getRightNeighborCount();
-
-        constexpr unsigned long long halfMax = maxNumberOfNeighbors / 2;
-
-        // Validate synapse index is within valid range
-        assert(synapseIndex >= oldStartSynapseBufferIdx && synapseIndex < oldEndSynapseBufferIdx);
-
-        Synapse* synapses = currentANN.synapses;
-        Neuron* neurons = currentANN.neurons;
-        unsigned long long& population = currentANN.population;
-
-        // Copy original neuron to the inserted one and set it as  Neuron::kEvolution type
-        Neuron insertNeuron;
-        insertNeuron = neurons[neuronIndex];
-        insertNeuron.type = Neuron::kEvolution;
-        unsigned long long insertedNeuronIdx = neuronIndex + 1;
-
-        char originalWeight = synapses[synapseFullBufferIdx].weight;
-
-        // Insert the neuron into array, population increased one, all neurons next to original one
-        // need to shift right
-        for (unsigned long long i = population; i > neuronIndex; --i)
-        {
-            neurons[i] = neurons[i - 1];
-
-            // Also shift the synapses to the right
-            memcpy(getSynapses(i), getSynapses(i - 1), maxNumberOfNeighbors * sizeof(Synapse));
-        }
-        neurons[insertedNeuronIdx] = insertNeuron;
-        population++;
-
-        // Recalculate after population change
-        unsigned long long newActualNeighbors = getActualNeighborCount();
-        unsigned long long newStartSynapseBufferIdx = getSynapseStartIndex();
-        unsigned long long newEndSynapseBufferIdx = getSynapseEndIndex();
-
-        // Try to update the synapse of inserted neuron. All outgoing synapse is init as zero weight
-        Synapse* pInsertNeuronSynapse = getSynapses(insertedNeuronIdx);
-        for (unsigned long long synIdx = 0; synIdx < maxNumberOfNeighbors; ++synIdx)
-        {
-            pInsertNeuronSynapse[synIdx].weight = 0;
+            unsigned long long inputNeuronIdx = epochRandoms.inputNeuronPositions[i] % neuronCount;
+            neuronTypes[neuronIndices[inputNeuronIdx]] = Neuron::kInput;
+            neuronCount = neuronCount - 1;
+            neuronIndices[inputNeuronIdx] = neuronIndices[neuronCount];
         }
 
-        // Copy the outgoing synapse of original neuron
-        if (synapseIndex < halfMax)
+        // Output positions from the remaining pool
+        for (unsigned long long i = 0; i < numberOfOutputNeurons; ++i)
         {
-            // The synapse is going to a neuron to the left of the original neuron.
-            // Check if the incoming neuron is still contained in the neighbors of the inserted
-            // neuron. This is the case if the original `synapseIndex` is > 0, i.e.
-            // the original synapse if not going to the leftmost neighbor of the original neuron.
-            if (synapseIndex > newStartSynapseBufferIdx)
+            unsigned long long outputNeuronIdx = epochRandoms.outputNeuronPositions[i] % neuronCount;
+            neuronTypes[neuronIndices[outputNeuronIdx]] = Neuron::kOutput;
+            outputNeuronIndices[i] = neuronIndices[outputNeuronIdx];
+            neuronCount = neuronCount - 1;
+            neuronIndices[outputNeuronIdx] = neuronIndices[neuronCount];
+        }
+        // The remaining neurons stay kEvolution.
+
+        // Cache the indices of all updated (non-input) neurons for mutation.
+        numberOfUpdatedNeurons = 0;
+        for (unsigned long long i = 0; i < populationThreshold; ++i)
+        {
+            if (neuronTypes[i] != Neuron::kInput)
             {
-                // Decrease idx by one because the new neuron is inserted directly to the right of
-                // the original one.
-                pInsertNeuronSynapse[synapseIndex - 1].weight = originalWeight;
-            }
-            // If the incoming neuron of the original synapse if not contained in the neighbors of
-            // the inserted neuron, don't add the synapse.
-        }
-        else
-        {
-            // The synapse is going to a neuron to the right of the original neuron.
-            // In this case, the incoming neuron of the synapse is for sure contained in the
-            // neighbors of the inserted neuron and has the same idx (right side neighbors of
-            // inserted neuron = right side neighbors of original neuron before insertion).
-            pInsertNeuronSynapse[synapseIndex].weight = originalWeight;
-        }
-
-        // The change of synapse only impact neuron in [originalNeuronIdx - actualNeighbors / 2
-        // + 1, originalNeuronIdx +  actualNeighbors / 2] In the new index, it will be
-        // [originalNeuronIdx + 1 - actualNeighbors / 2, originalNeuronIdx + 1 +
-        // actualNeighbors / 2] [N0 N1 N2 original inserted N4 N5 N6], M = 2.
-        for (long long delta = -oldLeftCount; delta <= oldRightCount; ++delta)
-        {
-            // Only process the neighbors
-            if (delta == 0)
-            {
-                continue;
-            }
-            unsigned long long updatedNeuronIdx = clampNeuronIndex(insertedNeuronIdx, delta);
-
-            // Generate a list of neighbor index of current updated neuron NN
-            // Find the location of the inserted neuron in the list of neighbors
-            long long insertedNeuronIdxInNeigborList = -1;
-            for (long long k = 0; k < newActualNeighbors; k++)
-            {
-                unsigned long long nnIndex = getNeighborNeuronIndex(updatedNeuronIdx, k);
-                if (nnIndex == insertedNeuronIdx)
-                {
-                    insertedNeuronIdxInNeigborList = (long long)(newStartSynapseBufferIdx + k);
-                }
-            }
-
-            assert(insertedNeuronIdxInNeigborList >= 0);
-
-            Synapse* pUpdatedSynapses = getSynapses(updatedNeuronIdx);
-            // [N0 N1 N2 original inserted N4 N5 N6], M = 2.
-            // Case: neurons in range [N0 N1 N2 original], right synapses will be affected
-            if (delta < 0)
-            {
-                // Left side is kept as it is, only need to shift to the right side
-                for (long long k = (long long)newEndSynapseBufferIdx - 1; k >= insertedNeuronIdxInNeigborList; --k)
-                {
-                    // Updated synapse
-                    pUpdatedSynapses[k] = pUpdatedSynapses[k - 1];
-                }
-
-                // Incomming synapse from original neuron -> inserted neuron must be zero
-                if (delta == -1)
-                {
-                    pUpdatedSynapses[insertedNeuronIdxInNeigborList].weight = 0;
-                }
-            }
-            else // Case: neurons in range [inserted N4 N5 N6], left synapses will be affected
-            {
-                // Right side is kept as it is, only need to shift to the left side
-                for (long long k = (long long)newStartSynapseBufferIdx; k < insertedNeuronIdxInNeigborList; ++k)
-                {
-                    // Updated synapse
-                    pUpdatedSynapses[k] = pUpdatedSynapses[k + 1];
-                }
+                updatedNeuronIndices[numberOfUpdatedNeurons] = i;
+                numberOfUpdatedNeurons++;
             }
         }
     }
 
-
-    // Check which neurons/synapse need to be removed after mutation
-    unsigned long long scanRedundantNeurons()
-    {
-        unsigned long long population = currentANN.population;
-        Synapse* synapses = currentANN.synapses;
-        Neuron* neurons = currentANN.neurons;
-
-        unsigned long long startSynapseBufferIdx = getSynapseStartIndex();
-        unsigned long long endSynapseBufferIdx = getSynapseEndIndex();
-        long long leftCount = (long long)getLeftNeighborCount();
-        long long rightCount = (long long)getRightNeighborCount();
-
-        unsigned long long numberOfRedundantNeurons = 0;
-        // After each mutation, we must verify if there are neurons that do not affect the ANN
-        // output. These are neurons that either have all incoming synapse weights as 0, or all
-        // outgoing synapse weights as 0. Such neurons must be removed.
-        for (unsigned long long i = 0; i < population; i++)
-        {
-            neurons[i].markForRemoval = false;
-            if (neurons[i].type == Neuron::kEvolution)
-            {
-                bool allOutGoingZeros = true;
-                bool allIncommingZeros = true;
-
-                // Loop though its synapses for checkout outgoing synapses
-                for (unsigned long long m = startSynapseBufferIdx; m < endSynapseBufferIdx; m++)
-                {
-                    char synapseW = synapses[i * maxNumberOfNeighbors + m].weight;
-                    if (synapseW != 0)
-                    {
-                        allOutGoingZeros = false;
-                        break;
-                    }
-                }
-
-                // Loop through the neighbor neurons to check all incoming synapses
-                for (long long offset = -leftCount; offset <= rightCount; offset++)
-                {
-                    if (offset == 0) continue;
-
-                    unsigned long long nnIdx = clampNeuronIndex(i, offset);
-                    long long synapseIdx = getIndexInSynapsesBuffer(-offset);
-                    if (synapseIdx < 0)
-                    {
-                        continue;
-                    }
-                    char synapseW = getSynapses(nnIdx)[synapseIdx].weight;
-
-                    if (synapseW != 0)
-                    {
-                        allIncommingZeros = false;
-                        break;
-                    }
-                }
-                if (allOutGoingZeros || allIncommingZeros)
-                {
-                    neurons[i].markForRemoval = true;
-                    numberOfRedundantNeurons++;
-                }
-            }
-        }
-        return numberOfRedundantNeurons;
-    }
-
-    // Remove neurons and synapses that do not affect the ANN
-    void cleanANN()
-    {
-        Neuron* neurons = currentANN.neurons;
-        unsigned long long& population = currentANN.population;
-
-        // Scan and remove neurons/synapses
-        unsigned long long neuronIdx = 0;
-        while (neuronIdx < population)
-        {
-            if (neurons[neuronIdx].markForRemoval)
-            {
-                // Remove it from the neuron list. Overwrite data
-                // Remove its synapses in the synapses array
-                removeNeuron(neuronIdx);
-            }
-            else
-            {
-                neuronIdx++;
-            }
-        }
-    }
-#endif // variable-topology helpers (kept for ant-colony reference)
-
+    // Inference step, every non-input neuron looks up its next trit from the trits of its neighbours
     void processTick()
     {
-        unsigned long long population = currentANN.population;
+        const unsigned long long population = populationThreshold;
         Neuron* neurons = currentANN.neurons;
 
-        // Memset value of current one
-        memset(neuronValueBuffer, 0, sizeof(neuronValueBuffer));
-
-        // Loop though all neurons
-        unsigned long long startSynapseBufferIdx = getSynapseStartIndex();
-        unsigned long long endSynapseBufferIdx = getSynapseEndIndex();
-
-        for (long long n = 0; n < population; ++n)
+        for (unsigned long long n = 0; n < population; ++n)
         {
-            const Synapse* kSynapses = getSynapses(n);
-            long long neuronValue = neurons[n].value;
-            // Scan through all neighbor neurons and sum all connected neurons.
-            for (unsigned long long m = startSynapseBufferIdx; m < endSynapseBufferIdx; m++)
+            if (Neuron::kInput == neurons[n].type)
             {
-                char synapseWeight = kSynapses[m].weight;
-                long long offset = bufferIndexToOffset(m);
-                unsigned long long nnIndex = clampNeuronIndex(n, offset);
-
-                // Weight-sum
-                neuronValueBuffer[nnIndex] += synapseWeight * neuronValue;
+                nextNeuronValue[n] = neurons[n].value; // inputs are held
+                continue;
             }
+
+            // Base-3 index over the three neighbour trits, index = t0 + 3*t1 + 9*t2.
+            const unsigned long long t0 = neurons[sourceNeuron[n][0]].value;
+            const unsigned long long t1 = neurons[sourceNeuron[n][1]].value;
+            const unsigned long long t2 = neurons[sourceNeuron[n][2]].value;
+            nextNeuronValue[n] = currentANN.lut[n][t0 + 3 * t1 + 9 * t2];
         }
 
-        // Clamp the neuron value
-        for (long long n = 0; n < population; ++n)
+        // Commit the new values
+        for (unsigned long long n = 0; n < population; ++n)
         {
-            // Only non input neurons are updated
             if (Neuron::kInput != neurons[n].type)
             {
-                long long neuronValue = clampNeuron(neuronValueBuffer[n]);
-                neurons[n].value = neuronValue;
+                neurons[n].value = nextNeuronValue[n];
             }
         }
     }
+
     void loadTrainingData(unsigned long long trainingIndex)
     {
-        unsigned long long population = currentANN.population;
+        const unsigned long long population = populationThreshold;
         Neuron* neurons = currentANN.neurons;
 
         const auto& data = trainingSet[trainingIndex];
-        // Load the input neuron value
         unsigned long long inputIndex = 0;
         for (unsigned long long n = 0; n < population; ++n)
         {
-            // Init as zeros
-            neurons[n].value = 0;
             if (Neuron::kInput == neurons[n].type)
             {
-                neurons[n].value = data.input[inputIndex];
+                neurons[n].value = bipolarToTrit(data.input[inputIndex]);
                 inputIndex++;
+            }
+            else
+            {
+                neurons[n].value = TRIT_UNKNOWN; // undecided before the dynamics run
             }
         }
 
-        // Load the expected output value
-        memcpy(outputNeuronExpectedValue, data.output, sizeof(outputNeuronExpectedValue[0]) * numberOfOutputNeurons);
+        for (unsigned long long i = 0; i < numberOfOutputNeurons; ++i)
+        {
+            outputNeuronExpectedValue[i] = bipolarToTrit(data.output[i]);
+        }
     }
+
     // Tick simulation only runs on one ANN
     void runTickSimulation(unsigned long long trainingIndex)
     {
-        unsigned long long population = currentANN.population;
+        const unsigned long long population = populationThreshold;
         Neuron* neurons = currentANN.neurons;
 
-        // Load the training set and fill ANN value
         loadTrainingData(trainingIndex);
-
-        // Save the neuron value for comparison
-        for (unsigned long long i = 0; i < population; ++i)
-        {
-            // Backup the neuron value
-            previousNeuronValue[i] = neurons[i].value;
-        }
 
         for (unsigned long long tick = 0; tick < numberOfTicks; ++tick)
         {
             processTick();
-            // Check exit conditions:
-            // - N ticks have passed (already in for loop)
-            // - All neuron values are unchanged
-            // - All output neurons have non-zero values
-            bool allNeuronsUnchanged = true;
-            bool allOutputNeuronsIsNonZeros = true;
-            for (long long n = 0; n < population; ++n)
+            // Exit early once every output neuron is decided (left the UNKNOWN trit).
+            bool allOutputsDecided = true;
+            for (unsigned long long n = 0; n < population; ++n)
             {
-                // Neuron unchanged check
-                if (previousNeuronValue[n] != neurons[n].value)
+                if (neurons[n].type == Neuron::kOutput && neurons[n].value == TRIT_UNKNOWN)
                 {
-                    allNeuronsUnchanged = false;
-                }
-
-                // Ouput neuron value check
-                if (neurons[n].type == Neuron::kOutput && neurons[n].value == 0)
-                {
-                    allOutputNeuronsIsNonZeros = false;
+                    allOutputsDecided = false;
                 }
             }
 
-            if (allOutputNeuronsIsNonZeros || allNeuronsUnchanged)
+            if (allOutputsDecided)
             {
                 break;
-            }
-
-            // Copy the neuron value
-            for (long long n = 0; n < population; ++n)
-            {
-                previousNeuronValue[n] = neurons[n].value;
             }
         }
     }
 
-    unsigned int computeMatchingOutput()
+    // Count the output errors of the current ANN, FALSE (decided wrong) and UNKNOWN (undecided).
+    void countOutputErrors(Score& score)
     {
-        unsigned long long population = currentANN.population;
+        const unsigned long long population = populationThreshold;
         Neuron* neurons = currentANN.neurons;
 
-        // Compute the non-matching value R between output neuron value and initial value
-        // Because the output neuron order never changes, the order is preserved
-        unsigned int R = 0;
         unsigned long long outputIdx = 0;
         for (unsigned long long i = 0; i < population; i++)
         {
             if (neurons[i].type == Neuron::kOutput)
             {
-                if (neurons[i].value == outputNeuronExpectedValue[outputIdx])
+                const unsigned char t = neurons[i].value;
+                const unsigned char e = outputNeuronExpectedValue[outputIdx];
+                if (t == TRIT_UNKNOWN)
                 {
-                    R++;
+                    score.numberOfUnknowns++;
+                }
+                else if (t != e)
+                {
+                    score.numberOfFalses++;
                 }
                 outputIdx++;
             }
         }
-        return R;
     }
 
     // Generate all 2^K possible (A, B, C) pairs
-    void generateTrainingSet()
+    void generateFullTrainingSet()
     {
         static constexpr long long boundValue = (1LL << (numberOfInputNeurons / 2)) / 2;
         unsigned long long index = 0;
@@ -735,133 +400,157 @@ struct Miner
             {
                 long long C = A + B;
 
-                toTenaryBits<numberOfInputNeurons / 2>(A, trainingSet[index].input);
+                toTenaryBits<numberOfInputNeurons / 2>(A, fullTrainingSet[index].input);
                 toTenaryBits<numberOfInputNeurons / 2>(
-                    B, trainingSet[index].input + numberOfInputNeurons / 2);
-                toTenaryBits<numberOfOutputNeurons>(C, trainingSet[index].output);
+                    B, fullTrainingSet[index].input + numberOfInputNeurons / 2);
+                toTenaryBits<numberOfOutputNeurons>(C, fullTrainingSet[index].output);
                 index++;
             }
         }
     }
 
-    unsigned int inferANN()
+    // Run the ANN over the selected training subset and return its error counts.
+    Score inferANN()
     {
-        // Synapses live as packed 2-bit values in currentANN.synapsesPacked.
-        // Decoded char buffer once per inference.
-        decodeSynapses();
-
-        unsigned int score = 0;
+        Score score;
+        score.numberOfFalses = 0;
+        score.numberOfUnknowns = 0;
         for (unsigned long long i = 0; i < trainingSetSize; ++i)
         {
-            // Ticks simulation
             runTickSimulation(i);
-
-            // Compute R
-            unsigned int R = computeMatchingOutput();
-            score += R;
+            countOutputErrors(score);
         }
         return score;
     }
 
-    unsigned int initializeANN(unsigned char* publicKey, unsigned char* nonce)
+    // Rewrite a single LUT line of a single updated (non-input) neuron to a different trit.
+    //  bit 0 selects the change, and the high bits select LUT-line to change
+    void mutate(unsigned long long mutationSeed)
+    {
+        // bit 0: which of the two other trits to move to (always a change)
+        const unsigned long long delta = mutationSeed & 1ULL;
+
+        // bits 1..63: which LUT line
+        const unsigned long long totalLines = numberOfUpdatedNeurons * lutSize;
+        const unsigned long long flatIdx = (mutationSeed >> 1) % totalLines;
+        const unsigned long long neuronIdx = updatedNeuronIndices[flatIdx / lutSize];
+        const unsigned long long line = flatIdx % lutSize;
+
+        const unsigned char oldTrit = currentANN.lut[neuronIdx][line];
+        const unsigned char newTrit = (unsigned char)((oldTrit + 1 + delta) % 3);
+        currentANN.lut[neuronIdx][line] = newTrit;
+    }
+
+    Score initializeANN(unsigned char* publicKey, unsigned char* nonce)
     {
         unsigned char hash[32];
         unsigned char combined[64];
         memcpy(combined, publicKey, 32);
         memcpy(combined + 32, nonce, 32);
+        // K, L and the algo bit live in nonce[0..2], exclude them from the RNG
+        combined[32] = 0;
+        combined[33] = 0;
+        combined[34] = 0;
         KangarooTwelve(combined, 64, hash, 32);
 
-        unsigned long long& population = currentANN.population;
+        const unsigned long long population = populationThreshold;
         Neuron* neurons = currentANN.neurons;
 
-        // Initialization -- fixed-topology: population is N total, set once.
-        population = populationThreshold;
-
-        // Generate all 2^K possible (A, B, C) pairs
-        generateTrainingSet();
-
-        // Initalize with nonce and public key
+        // LUT init and the mutation come from the nonce
         random2(hash, poolVec.data(), (unsigned char*)&initValue, sizeof(InitValue));
 
-        // Randomly choose the positions of neurons types.
-        // Default = Input.
+        // Apply the epoch-fixed neuron placement
         for (unsigned long long i = 0; i < population; ++i)
         {
-            neuronIndices[i] = i;
-            neurons[i].type = Neuron::kInput;
+            neurons[i].type = neuronTypes[i];
+            neurons[i].value = TRIT_UNKNOWN;
         }
-        unsigned long long neuronCount = population;
-        // Output positions from the remaining pool
-        for (unsigned long long i = 0; i < numberOfOutputNeurons; ++i)
+
+        // Seed every LUT line with a trit.
+        for (unsigned long long n = 0; n < population; ++n)
         {
-            unsigned long long outputNeuronIdx = initValue.outputNeuronPositions[i] % neuronCount;
-
-            // Fill the neuron type
-            neurons[neuronIndices[outputNeuronIdx]].type = Neuron::kOutput;
-            outputNeuronIndices[i] = neuronIndices[outputNeuronIdx];
-
-            // This index is used, copy the end of indices array to current position and decrease
-            // the number of picking neurons
-            neuronCount = neuronCount - 1;
-            neuronIndices[outputNeuronIdx] = neuronIndices[neuronCount];
+            for (unsigned long long line = 0; line < lutSize; ++line)
+            {
+                currentANN.lut[n][line] = (unsigned char)(initValue.lutInit[n * lutSize + line] % 3);
+            }
         }
 
-        // Evolution positions from the remaining pool
-        for (unsigned long long i = 0; i < numberOfEvolutionNeurons; ++i)
-        {
-            unsigned long long evolutionNeuronIdx = initValue.evolutionNeuronPositions[i] % neuronCount;
-
-            neurons[neuronIndices[evolutionNeuronIdx]].type = Neuron::kEvolution;
-
-            neuronCount = neuronCount - 1;
-            neuronIndices[evolutionNeuronIdx] = neuronIndices[neuronCount];
-        }
-
-        // Synapse weight initialization, already in the 2-bit packed, just copy them
-        memcpy(currentANN.synapsesPacked,
-               initValue.synapseWeight,
-               sizeof(currentANN.synapsesPacked));
-
-        // Run the first inference to get starting point before mutation
-        unsigned int score = inferANN();
-
-        return score;
+        // Error counts of the starting ANN.
+        return inferANN();
     }
 
-    // Main function for mining
+    // Main mining function: N mutation steps with the anti-attractor split
     unsigned int computeScore(unsigned char* publicKey, unsigned char* nonce)
     {
-        // Initialize
-        unsigned int bestR = initializeANN(publicKey, nonce);
+        // Miner knobs from nonce[1..2], do not affect the RNG.
+        unsigned int L = nonce[1];
+        if (L < 1)
+        {
+            L = 1;
+        }
+        if (L > MAX_LUT_ENTRIES_PER_STEP)
+        {
+            L = MAX_LUT_ENTRIES_PER_STEP;
+        }
+        unsigned long long K = nonce[2];
+        if (K > numberOfMutations)
+        {
+            K = numberOfMutations;
+        }
+
+        Score cur = initializeANN(publicKey, nonce);
         memcpy(&bestANN, &currentANN, sizeof(bestANN));
+        Score best = cur;
 
         for (unsigned long long s = 0; s < numberOfMutations; ++s)
         {
-            mutate(initValue.synapseMutation[s]);
+            // Snapshot for the one-step rollback.
+            memcpy(&prevANN, &currentANN, sizeof(prevANN));
 
-            // Ticks simulation
-            unsigned int R = inferANN();
-
-            // Roll back if neccessary
-            if (R >= bestR)
+            // Apply L LUT-entry mutations from this step's fixed seed slot.
+            for (unsigned int i = 0; i < L; ++i)
             {
-                bestR = R;
-                // Better R. Save the state
-                memcpy(&bestANN, &currentANN, sizeof(bestANN));
+                mutate(initValue.mutationSeed[s * MAX_LUT_ENTRIES_PER_STEP + i]);
+            }
+
+            const Score r = inferANN();
+            const int c = compare(r.numberOfFalses, r.numberOfUnknowns, cur.numberOfFalses, cur.numberOfUnknowns);
+
+            bool accept = false;
+            if (s < K)
+            {
+                // First K steps, keep the mutation if it made the score worse.
+                accept = (c >= 0);
             }
             else
             {
-                // Roll back
-                memcpy(&currentANN, &bestANN, sizeof(bestANN));
+                // Then, keep the mutation if it made the score better.
+                accept = (c <= 0);
+            }
+
+            if (accept)
+            {
+                cur = r;
+            }
+            else
+            {
+                // Roll back one step (to the previous position, NOT to the best).
+                memcpy(&currentANN, &prevANN, sizeof(currentANN));
+            }
+
+            if (compare(cur.numberOfFalses, cur.numberOfUnknowns, best.numberOfFalses, best.numberOfUnknowns) < 0)
+            {
+                best = cur;
+                memcpy(&bestANN, &currentANN, sizeof(bestANN));
             }
         }
-        return bestR;
+        return best.numberOfFalses + best.numberOfUnknowns;
     }
 
     bool findSolution(unsigned char* publicKey, unsigned char* nonce)
     {
-        unsigned int score = computeScore(publicKey, nonce);
-        if (score >= solutionThreshold)
+        unsigned int totalErrors = computeScore(publicKey, nonce);
+        if (totalErrors <= solutionThreshold)
         {
             return true;
         }
