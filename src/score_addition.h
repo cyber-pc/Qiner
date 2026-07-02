@@ -96,6 +96,9 @@ struct Miner
     };
     ANN bestANN;
     ANN currentANN;
+    // Ant-colony, holds a derived per-identity root, kept distinct from currentANN/bestANN so it can
+    // be passed as the parent to computeScoreFromParent() without aliasing currentANN.
+    ANN rootScratchANN;
 
     // Decoded synapse buffer (derived from currentANN.synapsesPacked).
     Synapse synapses[maxNumberOfSynapses];
@@ -277,315 +280,6 @@ struct Miner
         nnIndex = nnIndex % population;
         return (unsigned long long)nnIndex;
     }
-    
-
-    // Variable-topology helpers below are preserved (not compiled) for potential ant-colony
-    // reuse. Not used in fixed topology.
-#if 0
-    // Get the pointer to all outgoing synapse of a neurons
-    Synapse* getSynapses(unsigned long long neuronIndex)
-    {
-        return &currentANN.synapses[neuronIndex * maxNumberOfNeighbors];
-    }
-
-    // Remove a neuron and all synapses relate to it
-    void removeNeuron(unsigned long long neuronIdx)
-    {
-        long long leftCount = (long long)getLeftNeighborCount();
-        long long rightCount = (long long)getRightNeighborCount();
-        unsigned long long startSynapseBufferIdx = getSynapseStartIndex();
-        unsigned long long endSynapseBufferIdx = getSynapseEndIndex();
-
-        // Scan all its neighbor to remove their outgoing synapse point to the neuron
-        for (long long neighborOffset = -leftCount; neighborOffset <= rightCount; neighborOffset++)
-        {
-            if (neighborOffset == 0) continue;
-
-            unsigned long long nnIdx = clampNeuronIndex(neuronIdx, neighborOffset);
-            Synapse* pNNSynapses = getSynapses(nnIdx);
-
-            long long synapseIndexOfNN = getIndexInSynapsesBuffer(-neighborOffset);
-            if (synapseIndexOfNN < 0)
-            {
-                continue;
-            }
-
-            // The synapse array need to be shifted regard to the remove neuron
-            // Also neuron need to have 2M neighbors, the addtional synapse will be set as zero
-            // weight Case1 [S0 S1 S2 - SR S5 S6]. SR is removed, [S0 S1 S2 S5 S6 0] Case2 [S0 S1 SR
-            // - S3 S4 S5]. SR is removed, [0 S0 S1 S3 S4 S5]
-            constexpr unsigned long long halfMax = maxNumberOfNeighbors / 2;
-            if (synapseIndexOfNN >= (long long)halfMax)
-            {
-                for (long long k = synapseIndexOfNN; k < (long long)endSynapseBufferIdx - 1; ++k)
-                {
-                    pNNSynapses[k] = pNNSynapses[k + 1];
-                }
-                pNNSynapses[endSynapseBufferIdx - 1].weight = 0;
-            }
-            else
-            {
-                for (long long k = synapseIndexOfNN; k > (long long)startSynapseBufferIdx; --k)
-                {
-                    pNNSynapses[k] = pNNSynapses[k - 1];
-                }
-                pNNSynapses[startSynapseBufferIdx].weight = 0;
-            }
-        }
-
-        // Shift the synapse array and the neuron array
-        for (unsigned long long shiftIdx = neuronIdx; shiftIdx < currentANN.population - 1; shiftIdx++)
-        {
-            currentANN.neurons[shiftIdx] = currentANN.neurons[shiftIdx + 1];
-
-            // Also shift the synapses
-            memcpy(
-                getSynapses(shiftIdx),
-                getSynapses(shiftIdx + 1),
-                maxNumberOfNeighbors * sizeof(Synapse));
-        }
-        currentANN.population--;
-    }
-
-    unsigned long long
-    getNeighborNeuronIndex(unsigned long long neuronIndex, unsigned long long neighborOffset)
-    {
-        const unsigned long long leftNeighbors = getLeftNeighborCount();
-        unsigned long long nnIndex = 0;
-        if (neighborOffset < leftNeighbors)
-        {
-            nnIndex = clampNeuronIndex(
-                neuronIndex + neighborOffset, -(long long)leftNeighbors);
-        }
-        else
-        {
-            nnIndex = clampNeuronIndex(
-                neuronIndex + neighborOffset + 1, -(long long)leftNeighbors);
-        }
-        return nnIndex;
-    }
-
-    void insertNeuron(unsigned long long neuronIndex, unsigned long long synapseIndex)
-    {
-        unsigned long long synapseFullBufferIdx = neuronIndex * maxNumberOfNeighbors + synapseIndex;
-        // Old value before insert neuron
-        unsigned long long oldStartSynapseBufferIdx = getSynapseStartIndex();
-        unsigned long long oldEndSynapseBufferIdx = getSynapseEndIndex();
-        unsigned long long oldActualNeighbors = getActualNeighborCount();
-        long long oldLeftCount = (long long)getLeftNeighborCount();
-        long long oldRightCount = (long long)getRightNeighborCount();
-
-        constexpr unsigned long long halfMax = maxNumberOfNeighbors / 2;
-
-        // Validate synapse index is within valid range
-        assert(synapseIndex >= oldStartSynapseBufferIdx && synapseIndex < oldEndSynapseBufferIdx);
-
-        Synapse* synapses = currentANN.synapses;
-        Neuron* neurons = currentANN.neurons;
-        unsigned long long& population = currentANN.population;
-
-        // Copy original neuron to the inserted one and set it as  Neuron::kEvolution type
-        Neuron insertNeuron;
-        insertNeuron = neurons[neuronIndex];
-        insertNeuron.type = Neuron::kEvolution;
-        unsigned long long insertedNeuronIdx = neuronIndex + 1;
-
-        char originalWeight = synapses[synapseFullBufferIdx].weight;
-
-        // Insert the neuron into array, population increased one, all neurons next to original one
-        // need to shift right
-        for (unsigned long long i = population; i > neuronIndex; --i)
-        {
-            neurons[i] = neurons[i - 1];
-
-            // Also shift the synapses to the right
-            memcpy(getSynapses(i), getSynapses(i - 1), maxNumberOfNeighbors * sizeof(Synapse));
-        }
-        neurons[insertedNeuronIdx] = insertNeuron;
-        population++;
-
-        // Recalculate after population change
-        unsigned long long newActualNeighbors = getActualNeighborCount();
-        unsigned long long newStartSynapseBufferIdx = getSynapseStartIndex();
-        unsigned long long newEndSynapseBufferIdx = getSynapseEndIndex();
-
-        // Try to update the synapse of inserted neuron. All outgoing synapse is init as zero weight
-        Synapse* pInsertNeuronSynapse = getSynapses(insertedNeuronIdx);
-        for (unsigned long long synIdx = 0; synIdx < maxNumberOfNeighbors; ++synIdx)
-        {
-            pInsertNeuronSynapse[synIdx].weight = 0;
-        }
-
-        // Copy the outgoing synapse of original neuron
-        if (synapseIndex < halfMax)
-        {
-            // The synapse is going to a neuron to the left of the original neuron.
-            // Check if the incoming neuron is still contained in the neighbors of the inserted
-            // neuron. This is the case if the original `synapseIndex` is > 0, i.e.
-            // the original synapse if not going to the leftmost neighbor of the original neuron.
-            if (synapseIndex > newStartSynapseBufferIdx)
-            {
-                // Decrease idx by one because the new neuron is inserted directly to the right of
-                // the original one.
-                pInsertNeuronSynapse[synapseIndex - 1].weight = originalWeight;
-            }
-            // If the incoming neuron of the original synapse if not contained in the neighbors of
-            // the inserted neuron, don't add the synapse.
-        }
-        else
-        {
-            // The synapse is going to a neuron to the right of the original neuron.
-            // In this case, the incoming neuron of the synapse is for sure contained in the
-            // neighbors of the inserted neuron and has the same idx (right side neighbors of
-            // inserted neuron = right side neighbors of original neuron before insertion).
-            pInsertNeuronSynapse[synapseIndex].weight = originalWeight;
-        }
-
-        // The change of synapse only impact neuron in [originalNeuronIdx - actualNeighbors / 2
-        // + 1, originalNeuronIdx +  actualNeighbors / 2] In the new index, it will be
-        // [originalNeuronIdx + 1 - actualNeighbors / 2, originalNeuronIdx + 1 +
-        // actualNeighbors / 2] [N0 N1 N2 original inserted N4 N5 N6], M = 2.
-        for (long long delta = -oldLeftCount; delta <= oldRightCount; ++delta)
-        {
-            // Only process the neighbors
-            if (delta == 0)
-            {
-                continue;
-            }
-            unsigned long long updatedNeuronIdx = clampNeuronIndex(insertedNeuronIdx, delta);
-
-            // Generate a list of neighbor index of current updated neuron NN
-            // Find the location of the inserted neuron in the list of neighbors
-            long long insertedNeuronIdxInNeigborList = -1;
-            for (long long k = 0; k < newActualNeighbors; k++)
-            {
-                unsigned long long nnIndex = getNeighborNeuronIndex(updatedNeuronIdx, k);
-                if (nnIndex == insertedNeuronIdx)
-                {
-                    insertedNeuronIdxInNeigborList = (long long)(newStartSynapseBufferIdx + k);
-                }
-            }
-
-            assert(insertedNeuronIdxInNeigborList >= 0);
-
-            Synapse* pUpdatedSynapses = getSynapses(updatedNeuronIdx);
-            // [N0 N1 N2 original inserted N4 N5 N6], M = 2.
-            // Case: neurons in range [N0 N1 N2 original], right synapses will be affected
-            if (delta < 0)
-            {
-                // Left side is kept as it is, only need to shift to the right side
-                for (long long k = (long long)newEndSynapseBufferIdx - 1; k >= insertedNeuronIdxInNeigborList; --k)
-                {
-                    // Updated synapse
-                    pUpdatedSynapses[k] = pUpdatedSynapses[k - 1];
-                }
-
-                // Incomming synapse from original neuron -> inserted neuron must be zero
-                if (delta == -1)
-                {
-                    pUpdatedSynapses[insertedNeuronIdxInNeigborList].weight = 0;
-                }
-            }
-            else // Case: neurons in range [inserted N4 N5 N6], left synapses will be affected
-            {
-                // Right side is kept as it is, only need to shift to the left side
-                for (long long k = (long long)newStartSynapseBufferIdx; k < insertedNeuronIdxInNeigborList; ++k)
-                {
-                    // Updated synapse
-                    pUpdatedSynapses[k] = pUpdatedSynapses[k + 1];
-                }
-            }
-        }
-    }
-
-
-    // Check which neurons/synapse need to be removed after mutation
-    unsigned long long scanRedundantNeurons()
-    {
-        unsigned long long population = currentANN.population;
-        Synapse* synapses = currentANN.synapses;
-        Neuron* neurons = currentANN.neurons;
-
-        unsigned long long startSynapseBufferIdx = getSynapseStartIndex();
-        unsigned long long endSynapseBufferIdx = getSynapseEndIndex();
-        long long leftCount = (long long)getLeftNeighborCount();
-        long long rightCount = (long long)getRightNeighborCount();
-
-        unsigned long long numberOfRedundantNeurons = 0;
-        // After each mutation, we must verify if there are neurons that do not affect the ANN
-        // output. These are neurons that either have all incoming synapse weights as 0, or all
-        // outgoing synapse weights as 0. Such neurons must be removed.
-        for (unsigned long long i = 0; i < population; i++)
-        {
-            neurons[i].markForRemoval = false;
-            if (neurons[i].type == Neuron::kEvolution)
-            {
-                bool allOutGoingZeros = true;
-                bool allIncommingZeros = true;
-
-                // Loop though its synapses for checkout outgoing synapses
-                for (unsigned long long m = startSynapseBufferIdx; m < endSynapseBufferIdx; m++)
-                {
-                    char synapseW = synapses[i * maxNumberOfNeighbors + m].weight;
-                    if (synapseW != 0)
-                    {
-                        allOutGoingZeros = false;
-                        break;
-                    }
-                }
-
-                // Loop through the neighbor neurons to check all incoming synapses
-                for (long long offset = -leftCount; offset <= rightCount; offset++)
-                {
-                    if (offset == 0) continue;
-
-                    unsigned long long nnIdx = clampNeuronIndex(i, offset);
-                    long long synapseIdx = getIndexInSynapsesBuffer(-offset);
-                    if (synapseIdx < 0)
-                    {
-                        continue;
-                    }
-                    char synapseW = getSynapses(nnIdx)[synapseIdx].weight;
-
-                    if (synapseW != 0)
-                    {
-                        allIncommingZeros = false;
-                        break;
-                    }
-                }
-                if (allOutGoingZeros || allIncommingZeros)
-                {
-                    neurons[i].markForRemoval = true;
-                    numberOfRedundantNeurons++;
-                }
-            }
-        }
-        return numberOfRedundantNeurons;
-    }
-
-    // Remove neurons and synapses that do not affect the ANN
-    void cleanANN()
-    {
-        Neuron* neurons = currentANN.neurons;
-        unsigned long long& population = currentANN.population;
-
-        // Scan and remove neurons/synapses
-        unsigned long long neuronIdx = 0;
-        while (neuronIdx < population)
-        {
-            if (neurons[neuronIdx].markForRemoval)
-            {
-                // Remove it from the neuron list. Overwrite data
-                // Remove its synapses in the synapses array
-                removeNeuron(neuronIdx);
-            }
-            else
-            {
-                neuronIdx++;
-            }
-        }
-    }
-#endif // variable-topology helpers (kept for ant-colony reference)
 
     void processTick()
     {
@@ -867,6 +561,58 @@ struct Miner
         }
 
         return false;
+    }
+
+    // Ant-colony: derive this identity's per-epoch root ANN = initializeANN(K12(identityPublicKey || spectrum digest)),
+    // Freshly initialize currentANN into rootScratchANN and returns it, so it can be passed as the parent to computeScoreFromParent()
+    // without aliasing currentANN. initializeANN() also generates the seed-independent training set
+    const ANN& deriveRootANN(unsigned char* identityPublicKey, unsigned char* seed)
+    {
+        initializeANN(identityPublicKey, seed);
+        memcpy(&rootScratchANN, &currentANN, sizeof(ANN));
+        return rootScratchANN;
+    }
+
+    // Ant-colony: score a child by evolving from a parent's ANN state instead of a freshly generated
+    // topology. Semantically identical to computeScore() except the topology + packed synapses come from
+    // the parent (loaded into currentANN), the child's mutation walk still seeds from K12(publicKey||nonce).
+    // Precondition: the training set is already generated (call deriveRootANN()/initializeANN() once first),
+    // this method does not regenerate it.
+    unsigned int computeScoreFromParent(const ANN& parentANN, unsigned char* publicKey, unsigned char* nonce)
+    {
+        // Load parent topology + packed synapses into currentANN.
+        memcpy(currentANN.neurons, parentANN.neurons, sizeof(parentANN.neurons));
+        memcpy(currentANN.synapsesPacked, parentANN.synapsesPacked, sizeof(parentANN.synapsesPacked));
+        currentANN.population = parentANN.population;
+
+        // Child mutation seeds from K12(publicKey || nonce).
+        unsigned char hash[32];
+        unsigned char combined[64];
+        memcpy(combined, publicKey, 32);
+        memcpy(combined + 32, nonce, 32);
+        KangarooTwelve(combined, 64, hash, 32);
+        random2(hash, poolVec.data(), (unsigned char*)&initValue, sizeof(InitValue));
+
+        // Baseline: re-derive the parent's score from the staged state.
+        unsigned int bestR = inferANN();
+        memcpy(&bestANN, &currentANN, sizeof(bestANN));
+
+        // Evolve (identical loop to computeScore()).
+        for (unsigned long long s = 0; s < numberOfMutations; ++s)
+        {
+            mutate(initValue.synapseMutation[s]);
+            unsigned int R = inferANN();
+            if (R >= bestR)
+            {
+                bestR = R;
+                memcpy(&bestANN, &currentANN, sizeof(bestANN));
+            }
+            else
+            {
+                memcpy(&currentANN, &bestANN, sizeof(bestANN));
+            }
+        }
+        return bestR;
     }
 };
 
