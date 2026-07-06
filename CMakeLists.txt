@@ -29,14 +29,20 @@ OPTION(BUILD_TOOLS "Build Qiner tools" OFF)
 # Main executable
 add_executable(${PROJECT_NAME} src/Qiner.cpp src/keyUtils.cpp)
 
+# Ant-colony reference miner
+add_executable(AntMiner src/AntMiner.cpp src/keyUtils.cpp)
+
 include_directories(${PROJECT_NAME} ./src)
 
 # Linking
 if(WIN32)
     target_compile_definitions(${PROJECT_NAME} PRIVATE NOMINMAX)
     target_link_libraries(${PROJECT_NAME} wsock32 ws2_32)
+    target_compile_definitions(AntMiner PRIVATE NOMINMAX)
+    target_link_libraries(AntMiner wsock32 ws2_32)
 else()
     target_link_libraries(${PROJECT_NAME} pthread)
+    target_link_libraries(AntMiner pthread)
 endif()
 
 # Other projects

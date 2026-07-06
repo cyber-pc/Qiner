@@ -2,12 +2,16 @@
 //
 // Validation harness for the core node's ant-colony mining: runs the full pipeline
 // (query epoch context, derive the per-identity root, grind children with
-// computeScoreFromParent, submit solutions, track its own growing tree), single-threaded,
-// no performance tuning
-// Usage: AntMiner [Node IP] [Node Port] [MiningID] [Signing Seed]
+// computeScoreFromParent, submit solutions, track its own growing tree).
+// One coordinator thread owns all network IO; N worker threads grind nonces against a
+// shared job (parent ANN + anchor digest) with one engine each and one shared 512MB pool.
+// With -dummy the score engine is not used at all: random solutions are submitted to
+// exercise the node's queue filter, publish gate, and reject paths.
+// Usage: AntMiner [Node IP] [Node Port] [MiningID] [Signing Seed] [Threads] [-dummy]
 
 #include <chrono>
 #include <thread>
+#include <mutex>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -136,7 +140,7 @@ static constexpr unsigned int ROOT_TICK_OFFSET = 0U;
 static constexpr unsigned int ROOT_INDEX_IN_TICK = 0xFFFFFFFFU;
 
 // The reference score engine, instantiated with the node's deployed ADDITION parameters
-using AntMinerT = score_addition::Miner<14, 8, 256, 256, 256, 256, 74100>;
+using AntMinerT = score_addition::Miner<14, 8, 256, 256, 256, 256, 67000>;
 
 static std::atomic<char> state(0);
 
@@ -480,12 +484,113 @@ static bool submitAntSolution(ServerSocket& sock,
     return sock.sendData((char*)&packet, sizeof(packet));
 }
 
+// Shared grind job: what the workers evolve against. The coordinator republishes it when the
+// anchor tick advances, a better parent resolves, or the threshold changes. Workers snapshot
+// it per nonce; a result stays valid even if the job moved on (freshness allows publishing
+// within N ticks of its anchor), so nothing is ever cancelled.
+struct GrindJob
+{
+    AntMinerT::ANN parentAnn;
+    unsigned int parentTickOffset;
+    unsigned int parentSolutionIndexInTick;
+    unsigned int parentScore;
+    // 0 for a ROOT parent
+    unsigned int parentDepth;
+    unsigned int anchorTick;
+    unsigned char anchorDigest[32];
+    unsigned int threshold;
+    bool valid;
+};
+static GrindJob gJob;
+static std::mutex gJobMutex;
+
+// A solution that cleared threshold and parent score on a worker; the coordinator applies the
+// sibling-floor gate and submits.
+struct GrindResult
+{
+    unsigned char nonce[32];
+    unsigned int score;
+    unsigned int anchorTick;
+    unsigned int parentTickOffset;
+    unsigned int parentSolutionIndexInTick;
+    unsigned int parentScore;
+    unsigned int parentDepth;
+    AntMinerT::ANN ann;
+};
+static std::vector<GrindResult> gResults;
+static std::mutex gResultsMutex;
+static std::atomic<unsigned long long> gIterations(0);
+
+// Worker: pure compute, never touches the network. Own engine, shared read-only pool.
+static void grindWorker(const unsigned char* pool, const unsigned char* computorPublicKey)
+{
+    auto miner = std::make_unique<AntMinerT>();
+    miner->setPool(pool);
+    miner->generateTrainingSet();
+
+    unsigned char pubkey[32];
+    memcpy(pubkey, computorPublicKey, 32);
+
+    while (!state)
+    {
+        GrindJob job;
+        {
+            std::lock_guard<std::mutex> guard(gJobMutex);
+            job = gJob;
+        }
+        if (!job.valid)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+
+        unsigned char nonce[32];
+        _rdrand64_step((unsigned long long*)&nonce[0]);
+        _rdrand64_step((unsigned long long*)&nonce[8]);
+        _rdrand64_step((unsigned long long*)&nonce[16]);
+        _rdrand64_step((unsigned long long*)&nonce[24]);
+        const unsigned int score = miner->computeScoreFromParent(job.parentAnn, pubkey, nonce, job.anchorDigest);
+        gIterations++;
+
+        if (score >= job.threshold && score > job.parentScore)
+        {
+            GrindResult result;
+            memcpy(result.nonce, nonce, 32);
+            result.score = score;
+            result.anchorTick = job.anchorTick;
+            result.parentTickOffset = job.parentTickOffset;
+            result.parentSolutionIndexInTick = job.parentSolutionIndexInTick;
+            result.parentScore = job.parentScore;
+            result.parentDepth = job.parentDepth;
+            memcpy(&result.ann, &miner->bestANN, sizeof(AntMinerT::ANN));
+            std::lock_guard<std::mutex> guard(gResultsMutex);
+            gResults.push_back(result);
+        }
+    }
+}
+
 int main(int argc, char* argv[])
 {
-    if (argc != 5)
+    if (argc < 5 || argc > 7)
     {
-        printf("Usage: AntMiner [Node IP] [Node Port] [MiningID] [Signing Seed]\n");
+        printf("Usage: AntMiner [Node IP] [Node Port] [MiningID] [Signing Seed] [Threads] [-dummy]\n");
+        printf("  Threads: grinder thread count; default = hardware cores - 1\n");
+        printf("  -dummy:  no scoring; submit random solutions (mixed valid-shaped, garbage-parent,\n");
+        printf("           stale-anchor) to exercise the node's queue filter and reject paths\n");
         return 1;
+    }
+    bool dummyMode = false;
+    int requestedThreads = 0;
+    for (int i = 5; i < argc; i++)
+    {
+        if (strcmp(argv[i], "-dummy") == 0)
+        {
+            dummyMode = true;
+        }
+        else
+        {
+            requestedThreads = std::atoi(argv[i]);
+        }
     }
     nodeIp = argv[1];
     nodePort = std::atoi(argv[2]);
@@ -542,14 +647,45 @@ int main(int argc, char* argv[])
     printf("Ant epoch context: threshold %u, freshness window %u ticks, %u solutions so far\n",
         epochContext.threshold, epochContext.freshnessWindow, epochContext.solutionCount);
 
-    // Full pipeline start: pool from the epoch digest, then this identity's root.
-    auto miner = std::make_unique<AntMinerT>();
-    miner->initialize(epochContext.spectrumDigest);
-    const AntMinerT::ANN rootAnn = miner->deriveRootANN(computorPublicKey, epochContext.spectrumDigest);
-    printf("Per-identity root derived.\n");
+    // Full pipeline start (skipped entirely in dummy mode - no score engine at all):
+    // ONE shared read-only pool from the epoch digest (fixed for the whole epoch on the
+    // node too), then this identity's root, then the grinder threads.
+    std::vector<unsigned char> sharedPool;
+    std::unique_ptr<AntMinerT> miner;
+    AntMinerT::ANN rootAnn;
+    memset(&rootAnn, 0, sizeof(rootAnn));
+    memset(&gJob, 0, sizeof(gJob));
+    std::vector<std::thread> workers;
+    if (dummyMode)
+    {
+        printf("Dummy mode: submitting random solutions, no scoring.\n");
+    }
+    else
+    {
+        sharedPool.resize(POOL_VEC_PADDING_SIZE);
+        generateRandom2Pool(epochContext.spectrumDigest, sharedPool.data());
+        miner = std::make_unique<AntMinerT>();
+        miner->setPool(sharedPool.data());
+        rootAnn = miner->deriveRootANN(computorPublicKey, epochContext.spectrumDigest);
+        printf("Per-identity root derived.\n");
+
+        unsigned int threadCount = std::thread::hardware_concurrency();
+        threadCount = (threadCount > 1) ? (threadCount - 1) : 1;
+        if (requestedThreads > 0)
+        {
+            threadCount = (unsigned int)requestedThreads;
+        }
+        for (unsigned int t = 0; t < threadCount; t++)
+        {
+            workers.emplace_back(grindWorker, sharedPool.data(), computorPublicKey);
+        }
+        printf("%u grinder threads started.\n", threadCount);
+    }
 
     std::vector<OwnNode> ownNodes;
-    unsigned long long iterations = 0;
+    // Latest mineable-parents listing (refreshed each resolve cycle); dummy mode picks
+    // real parent refs from it.
+    std::vector<AntMineableParent> listing;
     unsigned long long submitted = 0;
     auto lastResolveTime = std::chrono::steady_clock::now();
 
@@ -578,8 +714,8 @@ int main(int argc, char* argv[])
         // Anchor-first: the anchor digest is part of the child RNG seed, so the anchor is chosen
         // BEFORE grinding. Anchor at the latest COMPLETED tick (current - 1): its quorum votes are
         // stored and every node's anchor ring already holds it. The digest is derived from standard
-        // messages only and refetched when the tick advances (one compute takes about a second, so
-        // the anchor stays close to the current tick, well within the freshness window).
+        // messages only and refetched when the tick advances, so the anchor stays close to the
+        // current tick, well within the freshness window.
         if (!queryCurrentTickInfo(sock, tickInfo))
         {
             printf("Tick info query failed, reconnecting...\n");
@@ -624,44 +760,42 @@ int main(int argc, char* argv[])
             printf("Anchor tick %u digest=%llu\n", anchorTick, digestPrefix);
         }
 
-        // Grind one nonce (full scoring, exactly what the node recomputes on commit).
-        unsigned char nonce[32];
-        _rdrand64_step((unsigned long long*)&nonce[0]);
-        _rdrand64_step((unsigned long long*)&nonce[8]);
-        _rdrand64_step((unsigned long long*)&nonce[16]);
-        _rdrand64_step((unsigned long long*)&nonce[24]);
-        const unsigned int score = miner->computeScoreFromParent(parentAnn, computorPublicKey, nonce, cachedAnchorDigest);
-        iterations++;
-
-        if (score >= epochContext.threshold && score > parentScore)
+        if (dummyMode)
         {
-            const unsigned int floor = localSiblingFloor(ownNodes, parentTickOffset, parentSolutionIndexInTick, anchorTick, epochContext.freshnessWindow);
-            if (score <= floor)
+            // No scoring: fabricate one submission per loop pass. Mix of parent picks so the
+            // node's queue filter, publish gate, and reject stats all see traffic:
+            // real listed parent / ROOT / garbage ref, and occasionally a stale anchor.
+            unsigned int dummyParentTickOffset = ROOT_TICK_OFFSET;
+            unsigned int dummyParentIndex = ROOT_INDEX_IN_TICK;
+            unsigned long long roll = 0;
+            _rdrand64_step(&roll);
+            const unsigned int pick = (unsigned int)(roll % 100U);
+            if (pick < 60U && !listing.empty())
             {
-                continue;
+                const AntMineableParent& entry = listing[(roll >> 8) % listing.size()];
+                dummyParentTickOffset = entry.parentTickOffset;
+                dummyParentIndex = entry.parentSolutionIndexInTick;
             }
-
-            if (submitAntSolution(sock, signingSubseed, signingPrivateKey, signingPublicKey, computorPublicKey,
-                parentTickOffset, parentSolutionIndexInTick, anchorTick, nonce))
+            else if (pick >= 80U)
             {
-                submitted++;
-                OwnNode node;
-                memcpy(node.nonce, nonce, 32);
-                node.score = score;
-                node.anchorTick = anchorTick;
-                node.depth = parentNode ? parentNode->depth + 1U : 1U;
-                node.parentTickOffset = parentTickOffset;
-                node.parentSolutionIndexInTick = parentSolutionIndexInTick;
-                node.refKnown = false;
-                node.resolveAttempts = 0;
-                node.selfTickOffset = 0;
-                node.selfSolutionIndexInTick = 0;
-                memcpy(&node.ann, &miner->bestANN, sizeof(AntMinerT::ANN));
-                ownNodes.push_back(node);
-                printf("Submitted: depth %u, score %u (parent score %u, floor %u), anchor %u\n",
-                    node.depth, score, parentScore, floor, anchorTick);
+                dummyParentTickOffset = (unsigned int)((roll >> 8) % (tickInfo.tick - tickInfo.initialTick + 1U));
+                dummyParentIndex = (unsigned int)((roll >> 40) % 4U);
             }
-            else
+            unsigned int dummyAnchorTick = cachedAnchorTick;
+            unsigned long long anchorRoll = 0;
+            _rdrand64_step(&anchorRoll);
+            if ((anchorRoll % 10U) == 0U
+                && cachedAnchorTick > tickInfo.initialTick + epochContext.freshnessWindow + 20U)
+            {
+                dummyAnchorTick = cachedAnchorTick - epochContext.freshnessWindow - 10U;
+            }
+            unsigned char nonce[32];
+            _rdrand64_step((unsigned long long*)&nonce[0]);
+            _rdrand64_step((unsigned long long*)&nonce[8]);
+            _rdrand64_step((unsigned long long*)&nonce[16]);
+            _rdrand64_step((unsigned long long*)&nonce[24]);
+            if (!submitAntSolution(sock, signingSubseed, signingPrivateKey, signingPublicKey, computorPublicKey,
+                dummyParentTickOffset, dummyParentIndex, dummyAnchorTick, nonce))
             {
                 printf("Submit failed, reconnecting...\n");
                 sock.closeConnection();
@@ -669,6 +803,78 @@ int main(int argc, char* argv[])
                 {
                     std::this_thread::sleep_for(std::chrono::seconds(2));
                 }
+                continue;
+            }
+            submitted++;
+        }
+        else
+        {
+            // Publish the job for the grinder threads (parent, anchor, or threshold may have changed).
+            {
+                std::lock_guard<std::mutex> guard(gJobMutex);
+                memcpy(&gJob.parentAnn, &parentAnn, sizeof(AntMinerT::ANN));
+                gJob.parentTickOffset = parentTickOffset;
+                gJob.parentSolutionIndexInTick = parentSolutionIndexInTick;
+                gJob.parentScore = parentScore;
+                gJob.parentDepth = parentNode ? parentNode->depth : 0U;
+                gJob.anchorTick = cachedAnchorTick;
+                memcpy(gJob.anchorDigest, cachedAnchorDigest, 32);
+                gJob.threshold = epochContext.threshold;
+                gJob.valid = true;
+            }
+
+            // Drain worker hits: apply the sibling-floor gate, submit, track as own nodes.
+            std::vector<GrindResult> results;
+            {
+                std::lock_guard<std::mutex> guard(gResultsMutex);
+                results.swap(gResults);
+            }
+            bool submitFailed = false;
+            for (size_t i = 0; i < results.size(); i++)
+            {
+                const GrindResult& r = results[i];
+                const unsigned int floor = localSiblingFloor(ownNodes, r.parentTickOffset, r.parentSolutionIndexInTick, r.anchorTick, epochContext.freshnessWindow);
+                if (r.score <= floor)
+                {
+                    continue;
+                }
+
+                if (!submitAntSolution(sock, signingSubseed, signingPrivateKey, signingPublicKey, computorPublicKey,
+                    r.parentTickOffset, r.parentSolutionIndexInTick, r.anchorTick, r.nonce))
+                {
+                    // Requeue this and the remaining results; they stay valid within the
+                    // freshness window and get another chance after the reconnect.
+                    std::lock_guard<std::mutex> guard(gResultsMutex);
+                    gResults.insert(gResults.end(), results.begin() + i, results.end());
+                    submitFailed = true;
+                    break;
+                }
+                submitted++;
+                OwnNode node;
+                memcpy(node.nonce, r.nonce, 32);
+                node.score = r.score;
+                node.anchorTick = r.anchorTick;
+                node.depth = r.parentDepth + 1U;
+                node.parentTickOffset = r.parentTickOffset;
+                node.parentSolutionIndexInTick = r.parentSolutionIndexInTick;
+                node.refKnown = false;
+                node.resolveAttempts = 0;
+                node.selfTickOffset = 0;
+                node.selfSolutionIndexInTick = 0;
+                memcpy(&node.ann, &r.ann, sizeof(AntMinerT::ANN));
+                ownNodes.push_back(node);
+                printf("Submitted: depth %u, score %u (parent score %u, floor %u), anchor %u\n",
+                    node.depth, r.score, r.parentScore, floor, r.anchorTick);
+            }
+            if (submitFailed)
+            {
+                printf("Submit failed, reconnecting...\n");
+                sock.closeConnection();
+                while (!state && !sock.establishConnection(nodeIp, nodePort))
+                {
+                    std::this_thread::sleep_for(std::chrono::seconds(2));
+                }
+                continue;
             }
         }
 
@@ -695,6 +901,7 @@ int main(int argc, char* argv[])
 
             if (queryOk)
             {
+                listing = entries;
                 unsigned int resolved = 0;
                 for (OwnNode& node : ownNodes)
                 {
@@ -738,7 +945,7 @@ int main(int argc, char* argv[])
                     epochContext = refreshed;
                 }
                 printf("| %llu iterations | %llu submitted | %u/%zu accepted+resolved | tree size %u |\n",
-                    iterations, submitted, resolved, ownNodes.size(), epochContext.solutionCount);
+                    gIterations.load(), submitted, resolved, ownNodes.size(), epochContext.solutionCount);
             }
             else
             {
@@ -750,9 +957,16 @@ int main(int argc, char* argv[])
                 }
             }
         }
+        // Coordinator pace: the workers grind continuously; this loop only shuttles jobs,
+        // results, and queries.
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
+    for (std::thread& worker : workers)
+    {
+        worker.join();
+    }
     sock.closeConnection();
-    printf("AntMiner is shut down. %llu iterations, %llu submitted, %zu own nodes.\n", iterations, submitted, ownNodes.size());
+    printf("AntMiner is shut down. %llu iterations, %llu submitted, %zu own nodes.\n", gIterations.load(), submitted, ownNodes.size());
     return 0;
 }

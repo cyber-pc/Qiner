@@ -52,13 +52,23 @@ struct Miner
         populationThreshold > numberOfNeurons,
         "populationThreshold must be greater than numberOfNeurons");
 
-    std::vector<unsigned char> poolVec;
+    // Read-only random2 pool used by initializeANN()/computeScoreFromParent(). Either owned
+    // (initialize() generates it) or borrowed (setPool() - lets many engines share one 512MB
+    // pool, e.g. one per grinder thread).
+    const unsigned char* poolVec = nullptr;
+    std::vector<unsigned char> ownedPool;
 
     void initialize(unsigned char miningSeed[32])
     {
         // Init random2 pool with mining seed
-        poolVec.resize(POOL_VEC_PADDING_SIZE);
-        generateRandom2Pool(miningSeed, poolVec.data());
+        ownedPool.resize(POOL_VEC_PADDING_SIZE);
+        generateRandom2Pool(miningSeed, ownedPool.data());
+        poolVec = ownedPool.data();
+    }
+
+    void setPool(const unsigned char* pool)
+    {
+        poolVec = pool;
     }
 
     // Training set
@@ -475,7 +485,7 @@ struct Miner
         generateTrainingSet();
 
         // Initalize with nonce and public key
-        random2(hash, poolVec.data(), (unsigned char*)&initValue, sizeof(InitValue));
+        random2(hash, poolVec, (unsigned char*)&initValue, sizeof(InitValue));
 
         // Randomly choose the positions of neurons types.
         // Default = Input.
@@ -575,23 +585,27 @@ struct Miner
 
     // Ant-colony: score a child by evolving from a parent's ANN state instead of a freshly generated
     // topology. Semantically identical to computeScore() except the topology + packed synapses come from
-    // the parent (loaded into currentANN), the child's mutation walk still seeds from K12(publicKey||nonce).
+    // the parent (loaded into currentANN), the child's mutation walk seeds from
+    // K12(publicKey || nonce || anchorTickDigest). Binding the anchor tick's digest means the walk
+    // cannot be computed before the anchor tick exists; freshness caps publication at N ticks after it.
     // Precondition: the training set is already generated (call deriveRootANN()/initializeANN() once first),
     // this method does not regenerate it.
-    unsigned int computeScoreFromParent(const ANN& parentANN, unsigned char* publicKey, unsigned char* nonce)
+    unsigned int computeScoreFromParent(const ANN& parentANN, unsigned char* publicKey, unsigned char* nonce,
+                                        const unsigned char* anchorTickDigest)
     {
         // Load parent topology + packed synapses into currentANN.
         memcpy(currentANN.neurons, parentANN.neurons, sizeof(parentANN.neurons));
         memcpy(currentANN.synapsesPacked, parentANN.synapsesPacked, sizeof(parentANN.synapsesPacked));
         currentANN.population = parentANN.population;
 
-        // Child mutation seeds from K12(publicKey || nonce).
+        // Child mutation seeds from K12(publicKey || nonce || anchorTickDigest).
         unsigned char hash[32];
-        unsigned char combined[64];
+        unsigned char combined[96];
         memcpy(combined, publicKey, 32);
         memcpy(combined + 32, nonce, 32);
-        KangarooTwelve(combined, 64, hash, 32);
-        random2(hash, poolVec.data(), (unsigned char*)&initValue, sizeof(InitValue));
+        memcpy(combined + 64, anchorTickDigest, 32);
+        KangarooTwelve(combined, 96, hash, 32);
+        random2(hash, poolVec, (unsigned char*)&initValue, sizeof(InitValue));
 
         // Baseline: re-derive the parent's score from the staged state.
         unsigned int bestR = inferANN();

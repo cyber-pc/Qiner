@@ -389,50 +389,6 @@ TEST_CASE("processTick", "[tick]")
     }
 }
 
-// Disabled for fixed-topology
-#if 0
-TEST_CASE("insertNeuron", "[insert]")
-{
-    TestFixture fixture;
-    fixture.initializeANN();
-
-    // Count types before
-    unsigned long long inputsBefore = 0, outputsBefore = 0;
-    for (unsigned long long i = 0; i < fixture.miner->currentANN.population; i++)
-    {
-        if (fixture.miner->currentANN.neurons[i].type == TestMiner::Neuron::kInput)
-            inputsBefore++;
-        if (fixture.miner->currentANN.neurons[i].type == TestMiner::Neuron::kOutput)
-            outputsBefore++;
-    }
-
-    unsigned long long oldPop = fixture.miner->currentANN.population;
-    unsigned long long startIdx = fixture.miner->getSynapseStartIndex();
-
-    fixture.miner->insertNeuron(0, startIdx);
-
-    REQUIRE(fixture.miner->currentANN.population == oldPop + 1);
-    // Inserted at index 1 (after neuron 0)
-    REQUIRE(fixture.miner->currentANN.neurons[1].type == TestMiner::Neuron::kEvolution);
-
-    // Add more neuron
-    fixture.miner->insertNeuron(5, startIdx);
-
-    // Count types after
-    unsigned long long inputsAfter = 0, outputsAfter = 0;
-    for (unsigned long long i = 0; i < fixture.miner->currentANN.population; i++)
-    {
-        if (fixture.miner->currentANN.neurons[i].type == TestMiner::Neuron::kInput)
-            inputsAfter++;
-        if (fixture.miner->currentANN.neurons[i].type == TestMiner::Neuron::kOutput)
-            outputsAfter++;
-    }
-
-    REQUIRE(inputsAfter == inputsBefore);
-    REQUIRE(outputsAfter == outputsBefore);
-}
-#endif
-
 // Disabled: smallset assumed char `synapses[]` lived in ANN and tested add/sub-1 mutation
 // semantics. With packed-2-bit storage in ANN + Miner-scope decoded buffer, and bit-flip
 // mutation, both setup (memset ann.synapses) and assertions (seed-to-weight mapping) need
