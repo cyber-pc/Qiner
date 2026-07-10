@@ -94,10 +94,13 @@ struct Miner
         return true;
     }
 
-    // Fix the neuron placement and neighbour wiring deterministically from the epoch-start digest.
+    // Fix the neuron placement and neighbour wiring deterministically from the epoch-start digest,
+    // via the same random2 pool used for the LUT root and mutations.
     void setEpochStartSpectrumDigest(const unsigned char* epochStartSpectrumDigest)
     {
-        random(epochStartSpectrumDigest, 32, (unsigned char*)&epochRandoms, sizeof(epochRandoms));
+        unsigned char digestSeed[32];
+        memcpy(digestSeed, epochStartSpectrumDigest, 32);
+        random2(digestSeed, poolVec.data(), (unsigned char*)&epochRandoms, sizeof(epochRandoms));
 
         computeNeuronPlacement();
         computeSourceNeurons();
@@ -393,21 +396,26 @@ struct Miner
 
     unsigned int initializeANN(unsigned char* publicKey, unsigned char* nonce)
     {
-        unsigned char hash[32];
-        unsigned char combined[64];
-        memcpy(combined, publicKey, 32);
-        memcpy(combined + 32, nonce, 32);
-        // K, L and the algo bit live in nonce[0..2], exclude them from the RNG
-        combined[32] = 0;
-        combined[33] = 0;
-        combined[34] = 0;
-        KangarooTwelve(combined, 64, hash, 32);
-
         const unsigned long long population = populationThreshold;
         Neuron* neurons = currentANN.neurons;
 
-        // LUT init and the mutation come from the nonce
-        random2(hash, poolVec.data(), (unsigned char*)&initValue, sizeof(InitValue));
+        // Root LUT comes from the public key
+        unsigned char rootHash[32];
+        KangarooTwelve(publicKey, 32, rootHash, 32);
+        random2(rootHash, poolVec.data(), (unsigned char*)&initValue.lutInit, sizeof(initValue.lutInit));
+
+        // Mutation stream comes from public key + nonce, so different nonces explore different paths
+        // from that same root. K, L and the algo bit live in nonce[0..2], excluded so they do not
+        // perturb the stream.
+        unsigned char searchHash[32];
+        unsigned char combined[64];
+        memcpy(combined, publicKey, 32);
+        memcpy(combined + 32, nonce, 32);
+        combined[32] = 0;
+        combined[33] = 0;
+        combined[34] = 0;
+        KangarooTwelve(combined, 64, searchHash, 32);
+        random2(searchHash, poolVec.data(), (unsigned char*)&initValue.mutationSeed, sizeof(initValue.mutationSeed));
 
         // Apply the epoch-fixed neuron placement
         for (unsigned long long i = 0; i < population; ++i)
