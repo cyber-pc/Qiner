@@ -52,7 +52,6 @@ template <
 struct Miner
 {
     static constexpr unsigned long long maxNumberOfNeurons = populationThreshold;
-    static constexpr unsigned long long feedCap = windowWidth;
     static constexpr unsigned long long numberOfWindows = sequenceLength - windowWidth;
 
     // Undecided trit (the third value); the two decided states are 0 and 1.
@@ -175,7 +174,7 @@ struct Miner
     struct ANN
     {
         Neuron neurons[maxNumberOfNeurons];
-        unsigned char lut[maxNumberOfNeurons][lutSize];
+        unsigned char lut[maxNumberOfNeurons * lutSize];
     };
     ANN bestANN;
     ANN currentANN;
@@ -192,8 +191,8 @@ struct Miner
     unsigned long long neuronIndices[maxNumberOfNeurons];
     unsigned char nextNeuronValue[maxNumberOfNeurons];
 
-    // Fixed neighbour, source neuron index for each (neuron, slot)
-    unsigned long long sourceNeuron[maxNumberOfNeurons][numberOfNeighbors];
+    // Fixed neighbour source neuron index for each (neuron, slot), flat as [n * numberOfNeighbors + k]
+    unsigned long long neighborIndices[maxNumberOfNeurons * numberOfNeighbors];
 
     unsigned long long inputNeuronIndices[numberOfInputNeurons];
     unsigned long long outputNeuronIndices[numberOfOutputNeurons];
@@ -220,7 +219,7 @@ struct Miner
         {
             for (unsigned long long k = 0; k < numberOfNeighbors; ++k)
             {
-                sourceNeuron[n][k] = epochRandoms.neighborDraws[n][k] % populationThreshold;
+                neighborIndices[n * numberOfNeighbors + k] = epochRandoms.neighborDraws[n][k] % populationThreshold;
             }
         }
     }
@@ -292,10 +291,10 @@ struct Miner
             }
 
             // Base-3 index over the three neighbour trits, index = t0 + 3*t1 + 9*t2.
-            const unsigned long long t0 = neurons[sourceNeuron[n][0]].value;
-            const unsigned long long t1 = neurons[sourceNeuron[n][1]].value;
-            const unsigned long long t2 = neurons[sourceNeuron[n][2]].value;
-            nextNeuronValue[n] = currentANN.lut[n][t0 + 3 * t1 + 9 * t2];
+            const unsigned long long t0 = neurons[neighborIndices[n * numberOfNeighbors + 0]].value;
+            const unsigned long long t1 = neurons[neighborIndices[n * numberOfNeighbors + 1]].value;
+            const unsigned long long t2 = neurons[neighborIndices[n * numberOfNeighbors + 2]].value;
+            nextNeuronValue[n] = currentANN.lut[n * lutSize + (t0 + 3 * t1 + 9 * t2)];
         }
 
         // Commit the new values
@@ -312,76 +311,66 @@ struct Miner
     // or INFINITE_ERROR if any window times out (an ANN has failed).
     unsigned int score()
     {
-        unsigned int numberOfFalses = 0;
-        unsigned int numberOfUnknowns = 0;
+        unsigned int numberOfFailures = 0;
 
         Neuron* neurons = currentANN.neurons;
 
-        for (unsigned long long t = 0; t < numberOfWindows; ++t)
+        for (unsigned long long trainingEntryIndex = 0; trainingEntryIndex < numberOfWindows; ++trainingEntryIndex)
         {
             unsigned long long feedCounter = 0;
 
-            // Blank slate, then load the first sample of the window.
+            // Blank slate: every neuron UNKNOWN, so the signal starts ready.
             for (unsigned long long n = 0; n < populationThreshold; ++n)
             {
                 neurons[n].value = TRIT_UNKNOWN;
             }
-            for (unsigned long long i = 0; i < numberOfInputNeurons; ++i)
-            {
-                neurons[inputNeuronIndices[i]].value = inputs[t + feedCounter][i];
-            }
-            feedCounter++;
 
-            unsigned long long tick = 0;
-            bool isFinalized = false;
-            while ((feedCounter < feedCap || !isFinalized) && tick < maxNumberOfTicks)
+            unsigned long long tick;
+            for (tick = 0; tick < maxNumberOfTicks; tick++)
             {
+                if (neurons[signalNeuronIndex].value == TRIT_UNKNOWN)
+                {
+                    // Signal ready. Once the whole window is in, the output neuron holds the
+                    // prediction - stop before running another tick; otherwise drive the next sample.
+                    if (feedCounter >= windowWidth)
+                    {
+                        break;
+                    }
+                    for (unsigned long long i = 0; i < numberOfInputNeurons; ++i)
+                    {
+                        neurons[inputNeuronIndices[i]].value = inputs[trainingEntryIndex + feedCounter][i];
+                    }
+                    feedCounter++;
+                }
+                else
+                {
+                    // Signal not ready, drive UNKNOWN and keep computing.
+                    for (unsigned long long i = 0; i < numberOfInputNeurons; ++i)
+                    {
+                        neurons[inputNeuronIndices[i]].value = TRIT_UNKNOWN;
+                    }
+                }
+
                 processTick();
-                tick++;
-
-                // Drive the input neurons: when the signal is ready feed the next sample (or finalize
-                // once the whole window is in), otherwise feed UNKNOWN and keep computing.
-                const bool ready = (neurons[signalNeuronIndex].value == TRIT_UNKNOWN);
-                for (unsigned long long i = 0; i < numberOfInputNeurons; ++i)
-                {
-                    neurons[inputNeuronIndices[i]].value = ready ? inputs[t + feedCounter][i] : TRIT_UNKNOWN;
-                }
-                if (ready)
-                {
-                    if (feedCounter < feedCap)
-                    {
-                        feedCounter++;
-                    }
-                    else
-                    {
-                        isFinalized = true;
-                    }
-                }
             }
+
             // A single timed-out window fails the whole ANN; the remaining windows cannot change
-            // that, and grading here would tally a wrong-index result (feedCounter never reached
-            // feedCap), so abandon this candidate immediately.
+            // that, so abandon this candidate immediately.
             if (tick == maxNumberOfTicks)
             {
                 return INFINITE_ERROR;
             }
 
+            // Any mismatch is a failure - a wrong decided trit and an UNKNOWN count the same.
             const unsigned char predicted = neurons[outputNeuronIndices[0]].value;
-            const unsigned char expected = outputs[t + feedCounter][0];
+            const unsigned char expected = outputs[trainingEntryIndex + feedCounter][0];
             if (predicted != expected)
             {
-                if (predicted == TRIT_UNKNOWN)
-                {
-                    numberOfUnknowns++;
-                }
-                else
-                {
-                    numberOfFalses++;
-                }
+                numberOfFailures++;
             }
         }
 
-        return numberOfFalses + numberOfUnknowns;
+        return numberOfFailures;
     }
 
     // Rewrite a single LUT line of a single updated (non-input) neuron to a different trit.
@@ -397,9 +386,9 @@ struct Miner
         const unsigned long long neuronIdx = updatedNeuronIndices[flatIdx / lutSize];
         const unsigned long long line = flatIdx % lutSize;
 
-        const unsigned char oldTrit = currentANN.lut[neuronIdx][line];
+        const unsigned char oldTrit = currentANN.lut[neuronIdx * lutSize + line];
         const unsigned char newTrit = (unsigned char)((oldTrit + 1 + delta) % 3);
-        currentANN.lut[neuronIdx][line] = newTrit;
+        currentANN.lut[neuronIdx * lutSize + line] = newTrit;
     }
 
     unsigned int initializeANN(unsigned char* publicKey, unsigned char* nonce)
@@ -432,7 +421,7 @@ struct Miner
         {
             for (unsigned long long line = 0; line < lutSize; ++line)
             {
-                currentANN.lut[n][line] = (unsigned char)(initValue.lutInit[n * lutSize + line] % 3);
+                currentANN.lut[n * lutSize + line] = (unsigned char)(initValue.lutInit[n * lutSize + line] % 3);
             }
         }
 
