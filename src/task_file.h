@@ -1,31 +1,31 @@
 #pragma once
 
-#include <cstdint>
 #include <cstdio>
-#include <cstring>
-#include <vector>
 
-// Generic binary container of P time-ordered (input, output) trit rows. This module owns only the
-// header layout, trit packing, and file IO. 
-// Trits are packed five per byte, one byte holds
-// t0 + 3*t1 + 9*t2 + 27*t3 + 81*t4 with each trit in {0, 1, 2}, so a valid byte is 0..242. Input
-// and output are packed per field; the last byte of each field zero-pads unused positions. The
-// file is native little-endian.
+// Unified binary task file format: [ header 96B ][ topology block ][ data block ].
+// Fixed-width fields use plain types (unsigned int = 32-bit, unsigned long long = 64-bit).
+//
+// Topology block (all unsigned int, native little-endian):
+//   inputNeuronIndices[N], outputNeuronIndices[M], signalNeuronIndex, neighborOffsets[K].
+// The wiring is a ring: neuron n's k-th neighbour is (n + neighborOffsets[k]) mod P - the same K
+// offsets for every neuron, so only K values are stored instead of P*K.
+// Data block: numPairs rows, each row = ceil(N/5) packed input bytes + ceil(M/5) packed output bytes.
+// Trits are packed five per byte: t0 + 3*t1 + 9*t2 + 27*t3 + 81*t4, so a valid byte is 0..242.
 namespace task_file
 {
 
-// Convenience magic/version for the Generic LUT task; callers pass these to write/load.
-static constexpr uint32_t MAGIC = 0x5454554CU;
-static constexpr uint32_t VERSION = 1;
+// Magic/version for the Generic LUT task; callers pass these to write/load.
+static constexpr unsigned int MAGIC = 0x5454554CU;
+static constexpr unsigned int VERSION = 1;
 
-// Store each value as a trit (3 states {0,1,2}, not a bit {0,1}) so the format can carry a third
-// state in future tasks. TRIT_BASE is how many states one value can take; 
-// TRITS_PER_BYTE is how many trits are packed into a byte (5 because 3^5 = 243 <= 256 is the tightest fit).
+// Store each value as a trit (3 states {0,1,2}) so the format can carry a third state in future tasks.
+// TRIT_BASE is how many states one value can take; TRITS_PER_BYTE is how many trits pack into a byte
+// (5 because 3^5 = 243 <= 256 is the tightest fit).
 static constexpr unsigned int TRIT_BASE = 3;
 static constexpr unsigned int TRITS_PER_BYTE = 5;
 
 // exp-th power of base, evaluated at compile time.
-constexpr uint64_t ipow(uint64_t base, unsigned int exp)
+constexpr unsigned long long ipow(unsigned long long base, unsigned int exp)
 {
     return exp == 0 ? 1 : base * ipow(base, exp - 1);
 }
@@ -33,36 +33,59 @@ constexpr uint64_t ipow(uint64_t base, unsigned int exp)
 // A packed byte holds values 0 .. BYTE_VALUE_LIMIT - 1 (243 = 3^5); anything at or above is invalid.
 static constexpr unsigned int BYTE_VALUE_LIMIT = (unsigned int)ipow(TRIT_BASE, TRITS_PER_BYTE);
 
-// Byte length of the data hash carried in the header.
+// Byte length of each hash carried in the header.
 static constexpr unsigned int DATA_HASH_SIZE = 32;
 
 #pragma pack(push, 1)
 struct TaskFileHeader
 {
-    uint32_t magic;
-    uint32_t version;
-    uint32_t numInputTrits;      // N, features per sample
-    uint32_t numOutputTrits;     // M, graded outputs per sample
-    uint64_t numPairs;           // P, number of samples
-    uint32_t population;         // ANN population (compatibility check)
-    unsigned char dataHash[DATA_HASH_SIZE];  // hash of the data (filled from outside)
-    uint32_t reserved;
+    unsigned int magic;
+    unsigned int version;
+    unsigned int numInputTrits;      // N, input trits per sample (= input neurons)
+    unsigned int numOutputTrits;     // M, output trits per sample (= output neurons)
+    unsigned long long numPairs;     // T, number of samples
+    unsigned int population;         // P, ANN neuron count
+    unsigned int numNeighbors;       // K, LUT fan-in (neighbours per neuron)
+    unsigned char topologyHash[DATA_HASH_SIZE];  // hash of the topology block
+    unsigned char dataHash[DATA_HASH_SIZE];      // hash of the (packed) data block
 };
 #pragma pack(pop)
 
-static_assert(sizeof(TaskFileHeader) == 64, "TaskFileHeader must be exactly 64 bytes");
+static_assert(sizeof(TaskFileHeader) == 96, "TaskFileHeader must be exactly 96 bytes");
+
+// Copy count bytes (self-contained, so no dependency on <cstring>).
+inline void copyBytes(unsigned char* dst, const unsigned char* src, unsigned long long count)
+{
+    for (unsigned long long i = 0; i < count; ++i)
+    {
+        dst[i] = src[i];
+    }
+}
 
 // ceil(tritCount / TRITS_PER_BYTE): bytes needed to hold that many trits at five trits per byte.
-inline uint64_t packedBytes(uint64_t tritCount)
+inline unsigned long long packedBytes(unsigned long long tritCount)
 {
     return (tritCount + (TRITS_PER_BYTE - 1)) / TRITS_PER_BYTE;
 }
 
-// Pack count trits {0,1,2} into out[], five per byte. Unused positions in the last byte are zero.
-inline void packTrits(const unsigned char* trits, uint64_t count, unsigned char* out)
+// Byte length of the topology block: inputNeuronIndices[N], outputNeuronIndices[M], one signal index,
+// and neighborOffsets[K] - all unsigned int.
+inline unsigned long long topologyBytes(unsigned int numInputTrits, unsigned int numOutputTrits, unsigned int numNeighbors)
 {
-    uint64_t byteIndex = 0;
-    for (uint64_t i = 0; i < count; i += TRITS_PER_BYTE)
+    return ((unsigned long long)numInputTrits + numOutputTrits + 1 + numNeighbors) * sizeof(unsigned int);
+}
+
+// Byte length of the packed data block.
+inline unsigned long long dataBytes(unsigned int numInputTrits, unsigned int numOutputTrits, unsigned long long numPairs)
+{
+    return numPairs * (packedBytes(numInputTrits) + packedBytes(numOutputTrits));
+}
+
+// Pack count trits {0,1,2} into out[], five per byte. Unused positions in the last byte are zero.
+inline void packTrits(const unsigned char* trits, unsigned long long count, unsigned char* out)
+{
+    unsigned long long byteIndex = 0;
+    for (unsigned long long i = 0; i < count; i += TRITS_PER_BYTE)
     {
         unsigned int packed = 0;
         unsigned int weight = 1;
@@ -77,12 +100,12 @@ inline void packTrits(const unsigned char* trits, uint64_t count, unsigned char*
     }
 }
 
-// Unpack count trits from bytes[] (five per byte). Returns false if any byte is not a valid
-// base-243 group (>= BYTE_VALUE_LIMIT). Only the first count trits are written; padding is skipped.
-inline bool unpackTrits(const unsigned char* bytes, uint64_t count, unsigned char* trits)
+// Unpack count trits from bytes[] (five per byte). Returns false if any byte is not a valid base-243
+// group (>= BYTE_VALUE_LIMIT). Only the first count trits are written; padding is skipped.
+inline bool unpackTrits(const unsigned char* bytes, unsigned long long count, unsigned char* trits)
 {
-    uint64_t byteIndex = 0;
-    for (uint64_t i = 0; i < count; i += TRITS_PER_BYTE)
+    unsigned long long byteIndex = 0;
+    for (unsigned long long i = 0; i < count; i += TRITS_PER_BYTE)
     {
         unsigned int packed = bytes[byteIndex];
         if (packed >= BYTE_VALUE_LIMIT)
@@ -102,57 +125,77 @@ inline bool unpackTrits(const unsigned char* bytes, uint64_t count, unsigned cha
     return true;
 }
 
-// Write a task file at path. The caller supplies magic, version, and the 32-byte dataHash.
-// inputsTrits holds numPairs * numInputTrits trits row-major (row t is sample t's N input trits);
-// outputsTrits holds numPairs * numOutputTrits trits row-major.
-inline bool writeTaskFile(const char* path,
-                          uint32_t magic,
-                          uint32_t version,
-                          uint32_t numInputTrits,
-                          uint32_t numOutputTrits,
-                          uint64_t numPairs,
-                          uint32_t population,
-                          const unsigned char* dataHash,
-                          const unsigned char* inputsTrits,
-                          const unsigned char* outputsTrits)
+// Serialise the topology into outBlock (topologyBytes long): input, output, signal, then the K
+// ring offsets (same for every neuron).
+inline void serializeTopologyBlock(unsigned int numInputTrits, unsigned int numOutputTrits, unsigned int numNeighbors,
+                                   const unsigned int* inputNeuronIndices, const unsigned int* outputNeuronIndices,
+                                   unsigned int signalNeuronIndex, const unsigned int* neighborOffsets,
+                                   unsigned char* outBlock)
 {
-    const uint64_t inBytes = packedBytes(numInputTrits);
-    const uint64_t outBytes = packedBytes(numOutputTrits);
-    const uint64_t rowBytes = inBytes + outBytes;
-    const uint64_t dataBytes = numPairs * rowBytes;
+    unsigned char* p = outBlock;
+    copyBytes(p, (const unsigned char*)inputNeuronIndices, (unsigned long long)numInputTrits * sizeof(unsigned int));
+    p += (unsigned long long)numInputTrits * sizeof(unsigned int);
+    copyBytes(p, (const unsigned char*)outputNeuronIndices, (unsigned long long)numOutputTrits * sizeof(unsigned int));
+    p += (unsigned long long)numOutputTrits * sizeof(unsigned int);
+    copyBytes(p, (const unsigned char*)&signalNeuronIndex, sizeof(unsigned int));
+    p += sizeof(unsigned int);
+    copyBytes(p, (const unsigned char*)neighborOffsets, (unsigned long long)numNeighbors * sizeof(unsigned int));
+}
 
-    std::vector<unsigned char> data((size_t)dataBytes, 0);
-    for (uint64_t p = 0; p < numPairs; ++p)
+// Parse a topology block (as read from the file) into the caller's arrays. Inverse of serialize.
+inline void parseTopologyBlock(const unsigned char* block, unsigned int numInputTrits, unsigned int numOutputTrits, unsigned int numNeighbors,
+                               unsigned int* outInputNeuronIndices, unsigned int* outOutputNeuronIndices,
+                               unsigned int* outSignalNeuronIndex, unsigned int* outNeighborOffsets)
+{
+    const unsigned char* p = block;
+    copyBytes((unsigned char*)outInputNeuronIndices, p, (unsigned long long)numInputTrits * sizeof(unsigned int));
+    p += (unsigned long long)numInputTrits * sizeof(unsigned int);
+    copyBytes((unsigned char*)outOutputNeuronIndices, p, (unsigned long long)numOutputTrits * sizeof(unsigned int));
+    p += (unsigned long long)numOutputTrits * sizeof(unsigned int);
+    copyBytes((unsigned char*)outSignalNeuronIndex, p, sizeof(unsigned int));
+    p += sizeof(unsigned int);
+    copyBytes((unsigned char*)outNeighborOffsets, p, (unsigned long long)numNeighbors * sizeof(unsigned int));
+}
+
+// Pack numPairs input/output trit rows into outBlock (dataBytes long), row-major.
+inline void packDataBlock(unsigned int numInputTrits, unsigned int numOutputTrits, unsigned long long numPairs,
+                          const unsigned char* inputsTrits, const unsigned char* outputsTrits,
+                          unsigned char* outBlock)
+{
+    const unsigned long long inBytes = packedBytes(numInputTrits);
+    const unsigned long long outBytes = packedBytes(numOutputTrits);
+    const unsigned long long rowBytes = inBytes + outBytes;
+    for (unsigned long long p = 0; p < numPairs; ++p)
     {
-        unsigned char* row = data.data() + p * rowBytes;
+        unsigned char* row = outBlock + p * rowBytes;
         packTrits(inputsTrits + p * numInputTrits, numInputTrits, row);
         packTrits(outputsTrits + p * numOutputTrits, numOutputTrits, row + inBytes);
     }
-
-    TaskFileHeader header;
-    memset(&header, 0, sizeof(header));
-    header.magic = magic;
-    header.version = version;
-    header.numInputTrits = numInputTrits;
-    header.numOutputTrits = numOutputTrits;
-    header.numPairs = numPairs;
-    header.population = population;
-    memcpy(header.dataHash, dataHash, DATA_HASH_SIZE);
-
-    FILE* f = fopen(path, "wb");
-    if (f == nullptr)
-    {
-        return false;
-    }
-    const bool ok =
-        fwrite(&header, 1, sizeof(header), f) == sizeof(header) &&
-        fwrite(data.data(), 1, (size_t)dataBytes, f) == dataBytes;
-    fclose(f);
-    return ok;
 }
 
-// Read just the 64-byte header, so the caller can validate magic, version, dimensions, and
-// population before committing to reading (and allocating) the data section.
+// Unpack a data block into the caller's input/output trit arrays. Returns false on a malformed byte.
+inline bool unpackDataBlock(unsigned int numInputTrits, unsigned int numOutputTrits, unsigned long long numPairs,
+                            const unsigned char* block, unsigned char* outInputs, unsigned char* outOutputs)
+{
+    const unsigned long long inBytes = packedBytes(numInputTrits);
+    const unsigned long long outBytes = packedBytes(numOutputTrits);
+    const unsigned long long rowBytes = inBytes + outBytes;
+    for (unsigned long long p = 0; p < numPairs; ++p)
+    {
+        const unsigned char* row = block + p * rowBytes;
+        if (!unpackTrits(row, numInputTrits, outInputs + p * numInputTrits))
+        {
+            return false;
+        }
+        if (!unpackTrits(row + inBytes, numOutputTrits, outOutputs + p * numOutputTrits))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Read just the 96-byte header, so the caller can validate dimensions before reading the blocks.
 inline bool readTaskFileHeader(const char* path, TaskFileHeader* outHeader)
 {
     FILE* f = fopen(path, "rb");
@@ -165,81 +208,42 @@ inline bool readTaskFileHeader(const char* path, TaskFileHeader* outHeader)
     return ok;
 }
 
-// Read and unpack the data section into the caller's outInputs / outOutputs buffers
-// each must hold header.numPairs * numInputTrits and header.numPairs *
-// numOutputTrits trits, which the caller has already validated via the header). header is the one
-// returned by readTaskFileHeader
-inline bool readTaskFileData(const char* path, 
-                             const TaskFileHeader& header,
-                             unsigned char* outInputs,
-                             unsigned char* outOutputs,
-                             const unsigned char* expectedDataHash = nullptr)
+// Read size bytes at offset into buf. Fails if the file is shorter than offset + size.
+inline bool readTaskFileBlock(const char* path, unsigned long long offset, unsigned char* buf, unsigned long long size)
 {
-    if (expectedDataHash != nullptr && memcmp(header.dataHash, expectedDataHash, DATA_HASH_SIZE) != 0)
-    {
-        return false;
-    }
-
     FILE* f = fopen(path, "rb");
     if (f == nullptr)
     {
         return false;
     }
-
-    const uint64_t inBytes = packedBytes(header.numInputTrits);
-    const uint64_t outBytes = packedBytes(header.numOutputTrits);
-    const uint64_t rowBytes = inBytes + outBytes;
-
-    // Confirm the file size matches the header's dimensions exactly, without trusting (or overflowing
-    // on) the declared numPairs. This also bounds the read below to the real file size.
-    if (fseek(f, 0, SEEK_END) != 0)
+    if (fseek(f, (long)offset, SEEK_SET) != 0)
     {
         fclose(f);
         return false;
     }
-    const long fileSize = ftell(f);
-    if (fileSize < (long)sizeof(header))
-    {
-        fclose(f);
-        return false;
-    }
-    const uint64_t availData = (uint64_t)fileSize - sizeof(header);
-    if (rowBytes == 0 || availData % rowBytes != 0 || availData / rowBytes != header.numPairs)
-    {
-        fclose(f);
-        return false;
-    }
-    if (fseek(f, (long)sizeof(header), SEEK_SET) != 0)
-    {
-        fclose(f);
-        return false;
-    }
-
-    std::vector<unsigned char> data((size_t)availData, 0);
-    if (fread(data.data(), 1, (size_t)availData, f) != availData)
-    {
-        fclose(f);
-        return false;
-    }
+    const bool ok = fread(buf, 1, (size_t)size, f) == size;
     fclose(f);
+    return ok;
+}
 
-    const uint64_t numPairs = header.numPairs;
-    const uint32_t numInputTrits = header.numInputTrits;
-    const uint32_t numOutputTrits = header.numOutputTrits;
-
-    for (uint64_t p = 0; p < numPairs; ++p)
+// Write [header][topology block][data block]. The caller fills the header (dimensions + both hashes)
+// and supplies the two already-assembled blocks.
+inline bool writeTaskFile(const char* path,
+                          const TaskFileHeader& header,
+                          const unsigned char* topoBlock, unsigned long long topoLen,
+                          const unsigned char* dataBlock, unsigned long long dataLen)
+{
+    FILE* f = fopen(path, "wb");
+    if (f == nullptr)
     {
-        const unsigned char* row = data.data() + p * rowBytes;
-        if (!unpackTrits(row, numInputTrits, outInputs + p * numInputTrits))
-        {
-            return false;
-        }
-        if (!unpackTrits(row + inBytes, numOutputTrits, outOutputs + p * numOutputTrits))
-        {
-            return false;
-        }
+        return false;
     }
-    return true;
+    const bool ok =
+        fwrite(&header, 1, sizeof(header), f) == sizeof(header) &&
+        fwrite(topoBlock, 1, (size_t)topoLen, f) == topoLen &&
+        fwrite(dataBlock, 1, (size_t)dataLen, f) == dataLen;
+    fclose(f);
+    return ok;
 }
 
 } // namespace task_file

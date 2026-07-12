@@ -54,6 +54,12 @@ struct Miner
     static constexpr unsigned long long maxNumberOfNeurons = populationThreshold;
     static constexpr unsigned long long numberOfWindows = sequenceLength - windowWidth;
 
+    static constexpr unsigned long long topoBlockSize =
+        (numberOfInputNeurons + numberOfOutputNeurons + 1 + numberOfNeighbors) * sizeof(uint32_t);
+    static constexpr unsigned long long dataBlockSize =
+        sequenceLength * (((numberOfInputNeurons + task_file::TRITS_PER_BYTE - 1) / task_file::TRITS_PER_BYTE)
+                          + ((numberOfOutputNeurons + task_file::TRITS_PER_BYTE - 1) / task_file::TRITS_PER_BYTE));
+
     // Undecided trit (the third value); the two decided states are 0 and 1.
     static constexpr unsigned char TRIT_UNKNOWN = 2;
 
@@ -78,36 +84,17 @@ struct Miner
 
     std::vector<unsigned char> poolVec;
 
-    // Load the task data from taskFilePath, then fix the neuron placement and neighbour wiring from
-    // the epoch-start spectrum digest. Returns false if the task file cannot be loaded or validated.
-    bool initialize(unsigned char* miningSeed, const unsigned char* epochStartSpectrumDigest, const char* taskFilePath)
+    // Init the random2 pool from the mining seed, then load the task file (topology + data).
+    // Returns false if the task file cannot be loaded or validated
+    bool initialize(unsigned char* miningSeed, const char* taskFilePath)
     {
-        // Init random2 pool with mining seed
         poolVec.resize(POOL_VEC_PADDING_SIZE);
         generateRandom2Pool(miningSeed, poolVec.data());
 
-        if (!loadTaskData(taskFilePath))
-        {
-            return false;
-        }
-        setEpochStartSpectrumDigest(epochStartSpectrumDigest);
-        return true;
+        return loadTaskData(taskFilePath);
     }
 
-    // Fix the neuron placement and neighbour wiring deterministically from the epoch-start digest,
-    // via the same random2 pool used for the LUT root and mutations.
-    void setEpochStartSpectrumDigest(const unsigned char* epochStartSpectrumDigest)
-    {
-        unsigned char digestSeed[32];
-        memcpy(digestSeed, epochStartSpectrumDigest, 32);
-        random2(digestSeed, poolVec.data(), (unsigned char*)&epochRandoms, sizeof(epochRandoms));
-
-        computeNeuronPlacement();
-        computeSourceNeurons();
-    }
-
-    // Read the task sequence from a task file into inputs/outputs. Validates the header against this
-    // engine's compile-time dimensions and the stored data hash. Returns false on any mismatch.
+    // Load the unified task file. Returns false on any mismatch.
     bool loadTaskData(const char* taskFilePath)
     {
         task_file::TaskFileHeader header;
@@ -120,29 +107,123 @@ struct Miner
             header.numInputTrits != numberOfInputNeurons ||
             header.numOutputTrits != numberOfOutputNeurons ||
             header.numPairs != sequenceLength ||
-            header.population != populationThreshold)
-        {
-            return false;
-        }
-        if (!task_file::readTaskFileData(taskFilePath, header, &inputs[0][0], &outputs[0][0]))
+            header.population != populationThreshold ||
+            header.numNeighbors != numberOfNeighbors)
         {
             return false;
         }
 
-        // Byte-level integrity: hash [all input trits || all output trits] and compare to the header.
-        const unsigned long long inputTritCount = sequenceLength * numberOfInputNeurons;
-        const unsigned long long outputTritCount = sequenceLength * numberOfOutputNeurons;
-        std::vector<unsigned char> hashBuf;
-        hashBuf.reserve((size_t)(inputTritCount + outputTritCount));
-        hashBuf.insert(hashBuf.end(), &inputs[0][0], &inputs[0][0] + inputTritCount);
-        hashBuf.insert(hashBuf.end(), &outputs[0][0], &outputs[0][0] + outputTritCount);
         unsigned char hash[task_file::DATA_HASH_SIZE];
-        KangarooTwelve(hashBuf.data(), (unsigned int)hashBuf.size(), hash, task_file::DATA_HASH_SIZE);
+
+        // Topology
+        if (!task_file::readTaskFileBlock(taskFilePath, sizeof(task_file::TaskFileHeader), topoBlockBuf, topoBlockSize))
+        {
+            return false;
+        }
+        KangarooTwelve(topoBlockBuf, (unsigned int)topoBlockSize, hash, task_file::DATA_HASH_SIZE);
+        if (memcmp(hash, header.topologyHash, task_file::DATA_HASH_SIZE) != 0)
+        {
+            return false;
+        }
+        task_file::parseTopologyBlock(topoBlockBuf, numberOfInputNeurons, numberOfOutputNeurons, numberOfNeighbors,
+                                      inputNeuronIndices, outputNeuronIndices, &signalNeuronIndex, neighborOffsets);
+        if (!validateTopology())
+        {
+            return false;
+        }
+
+        // Training data read, verify its hash, unpack into inputs/outputs.
+        if (!task_file::readTaskFileBlock(taskFilePath, sizeof(task_file::TaskFileHeader) + topoBlockSize, dataBlockBuf, dataBlockSize))
+        {
+            return false;
+        }
+        KangarooTwelve(dataBlockBuf, (unsigned int)dataBlockSize, hash, task_file::DATA_HASH_SIZE);
         if (memcmp(hash, header.dataHash, task_file::DATA_HASH_SIZE) != 0)
         {
             return false;
         }
+        if (!task_file::unpackDataBlock(numberOfInputNeurons, numberOfOutputNeurons, sequenceLength, dataBlockBuf, &inputs[0][0], &outputs[0][0]))
+        {
+            return false;
+        }
+
+        deriveNeuronRoles();
         return true;
+    }
+
+    // Validate the loaded topology
+    bool validateTopology()
+    {
+        for (unsigned long long i = 0; i < numberOfInputNeurons; ++i)
+        {
+            if (inputNeuronIndices[i] >= populationThreshold)
+            {
+                return false;
+            }
+        }
+        for (unsigned long long i = 0; i < numberOfOutputNeurons; ++i)
+        {
+            if (outputNeuronIndices[i] >= populationThreshold)
+            {
+                return false;
+            }
+        }
+        if (signalNeuronIndex >= populationThreshold)
+        {
+            return false;
+        }
+
+        // input, output and signal must be mutually distinct (one role per neuron).
+        bool seen[populationThreshold] = {};
+        for (unsigned long long i = 0; i < numberOfInputNeurons; ++i)
+        {
+            if (seen[inputNeuronIndices[i]])
+            {
+                return false;
+            }
+            seen[inputNeuronIndices[i]] = true;
+        }
+        for (unsigned long long i = 0; i < numberOfOutputNeurons; ++i)
+        {
+            if (seen[outputNeuronIndices[i]])
+            {
+                return false;
+            }
+            seen[outputNeuronIndices[i]] = true;
+        }
+        if (seen[signalNeuronIndex])
+        {
+            return false;
+        }
+        return true;
+    }
+
+    // Derive neuron types (input/output/evolution) and the updated-neuron list from the placement.
+    void deriveNeuronRoles()
+    {
+        for (unsigned long long i = 0; i < populationThreshold; ++i)
+        {
+            neuronTypes[i] = Neuron::kEvolution;
+        }
+        for (unsigned long long i = 0; i < numberOfInputNeurons; ++i)
+        {
+            neuronTypes[inputNeuronIndices[i]] = Neuron::kInput;
+        }
+        for (unsigned long long i = 0; i < numberOfOutputNeurons; ++i)
+        {
+            neuronTypes[outputNeuronIndices[i]] = Neuron::kOutput;
+        }
+        // The signal neuron stays kEvolution; only its index is tracked.
+
+        numberOfUpdatedNeurons = 0;
+        for (unsigned long long i = 0; i < populationThreshold; ++i)
+        {
+            if (neuronTypes[i] != Neuron::kInput)
+            {
+                updatedNeuronIndices[numberOfUpdatedNeurons] = i;
+                numberOfUpdatedNeurons++;
+            }
+        }
     }
 
     // SequenceLength samples, each numberOfInputNeurons input trits and
@@ -151,14 +232,9 @@ struct Miner
     unsigned char inputs[sequenceLength][numberOfInputNeurons];
     unsigned char outputs[sequenceLength][numberOfOutputNeurons];
 
-    // Per-epoch placement draws from the spectrum digest.
-    struct EpochRandoms
-    {
-        unsigned long long inputNeuronPositions[numberOfInputNeurons];
-        unsigned long long outputNeuronPositions[numberOfOutputNeurons];
-        unsigned long long signalNeuronPosition;
-        unsigned long long neighborDraws[populationThreshold][numberOfNeighbors];
-    } epochRandoms;
+    // Buffers
+    unsigned char topoBlockBuf[topoBlockSize];
+    unsigned char dataBlockBuf[dataBlockSize];
 
     // Data for running the ANN
     struct Neuron
@@ -191,93 +267,25 @@ struct Miner
     } initValue;
 
 
-    unsigned long long neuronIndices[maxNumberOfNeurons];
     unsigned char nextNeuronValue[maxNumberOfNeurons];
 
-    // Fixed neighbour source neuron index for each (neuron, slot), flat as [n * numberOfNeighbors + k]
-    unsigned long long neighborIndices[maxNumberOfNeurons * numberOfNeighbors];
+    // Topology loaded from the task file (uint32, matching the file layout)
+    uint32_t neighborOffsets[numberOfNeighbors];
 
-    unsigned long long inputNeuronIndices[numberOfInputNeurons];
-    unsigned long long outputNeuronIndices[numberOfOutputNeurons];
+    uint32_t inputNeuronIndices[numberOfInputNeurons];
+    uint32_t outputNeuronIndices[numberOfOutputNeurons];
 
     // One evolution neuron drives the feed handshake; it is computed and mutated like any other
     // evolution neuron, its value is only additionally read for flow control.
-    unsigned long long signalNeuronIndex;
+    uint32_t signalNeuronIndex;
 
-    // Epoch-fixed neuron placement (input/output/evolution), computed once from the spectrum digest.
+    // Epoch-fixed neuron placement (input/output/evolution), derived from the loaded topology.
     Neuron::Type neuronTypes[maxNumberOfNeurons];
 
     // Indices of all non-input neurons (output + evolution), the only ones whose LUT is used
-    // and the only ones a mutation may touch. Filled in computeNeuronPlacement().
+    // and the only ones a mutation may touch. Filled in deriveNeuronRoles().
     unsigned long long updatedNeuronIndices[maxNumberOfNeurons];
     unsigned long long numberOfUpdatedNeurons;
-
-    // Each neuron draws numberOfNeighbors source neurons uniformly from all neurons, using the
-    // epoch spectrum digest - so the wiring is global and identical on every node.
-    // populationThreshold is a power of two, so the modulo is an unbiased mask.
-    // Requires epochRandoms to be filled first (see setEpochStartSpectrumDigest).
-    void computeSourceNeurons()
-    {
-        for (unsigned long long n = 0; n < populationThreshold; ++n)
-        {
-            for (unsigned long long k = 0; k < numberOfNeighbors; ++k)
-            {
-                neighborIndices[n * numberOfNeighbors + k] = epochRandoms.neighborDraws[n][k] % populationThreshold;
-            }
-        }
-    }
-
-    // Neuron placement (input/output/evolution types plus the signal neuron) from the digest,
-    // computed once per epoch.
-    void computeNeuronPlacement()
-    {
-        for (unsigned long long i = 0; i < populationThreshold; ++i)
-        {
-            neuronIndices[i] = i;
-            neuronTypes[i] = Neuron::kEvolution;
-        }
-        unsigned long long neuronCount = populationThreshold;
-
-        // Input positions from the remaining pool
-        for (unsigned long long i = 0; i < numberOfInputNeurons; ++i)
-        {
-            unsigned long long inputNeuronIdx = epochRandoms.inputNeuronPositions[i] % neuronCount;
-            inputNeuronIndices[i] = neuronIndices[inputNeuronIdx];
-            neuronTypes[neuronIndices[inputNeuronIdx]] = Neuron::kInput;
-            neuronCount = neuronCount - 1;
-            neuronIndices[inputNeuronIdx] = neuronIndices[neuronCount];
-        }
-
-        // Output positions from the remaining pool
-        for (unsigned long long i = 0; i < numberOfOutputNeurons; ++i)
-        {
-            unsigned long long outputNeuronIdx = epochRandoms.outputNeuronPositions[i] % neuronCount;
-            neuronTypes[neuronIndices[outputNeuronIdx]] = Neuron::kOutput;
-            outputNeuronIndices[i] = neuronIndices[outputNeuronIdx];
-            neuronCount = neuronCount - 1;
-            neuronIndices[outputNeuronIdx] = neuronIndices[neuronCount];
-        }
-
-        // Signal neuron from the remaining pool. It stays kEvolution (computed and mutated like the
-        // rest), only its index is remembered so the feed handshake can read it.
-        unsigned long long signalIdx = epochRandoms.signalNeuronPosition % neuronCount;
-        signalNeuronIndex = neuronIndices[signalIdx];
-        neuronCount = neuronCount - 1;
-        neuronIndices[signalIdx] = neuronIndices[neuronCount];
-
-        // The remaining neurons stay kEvolution.
-
-        // Cache the indices of all updated (non-input) neurons for mutation.
-        numberOfUpdatedNeurons = 0;
-        for (unsigned long long i = 0; i < populationThreshold; ++i)
-        {
-            if (neuronTypes[i] != Neuron::kInput)
-            {
-                updatedNeuronIndices[numberOfUpdatedNeurons] = i;
-                numberOfUpdatedNeurons++;
-            }
-        }
-    }
 
     // Inference step, every non-input neuron looks up its next trit from the trits of its neighbours
     void processTick()
@@ -293,10 +301,10 @@ struct Miner
                 continue;
             }
 
-            // Base-3 index over the three neighbour trits, index = t0 + 3*t1 + 9*t2.
-            const unsigned long long t0 = neurons[neighborIndices[n * numberOfNeighbors + 0]].value;
-            const unsigned long long t1 = neurons[neighborIndices[n * numberOfNeighbors + 1]].value;
-            const unsigned long long t2 = neurons[neighborIndices[n * numberOfNeighbors + 2]].value;
+            // Ring neighbours (n + offset) mod P, then a base-3 index over their trits t0 + 3*t1 + 9*t2.
+            const unsigned long long t0 = neurons[(n + neighborOffsets[0]) % populationThreshold].value;
+            const unsigned long long t1 = neurons[(n + neighborOffsets[1]) % populationThreshold].value;
+            const unsigned long long t2 = neurons[(n + neighborOffsets[2]) % populationThreshold].value;
             nextNeuronValue[n] = currentANN.lut[n * lutSize + (t0 + 3 * t1 + 9 * t2)];
         }
 

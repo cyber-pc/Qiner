@@ -194,8 +194,8 @@ using HyperIdentityMiner = score_hyberidentity::Miner<
 int miningThreadProc()
 {
     std::unique_ptr<LutMiner> lutMiner(new LutMiner());
-    // Generic LUT needs the epoch-start Spectrum Digest (placement/wiring) and the task file (data).
-    if (!lutMiner->initialize(randomSeed, epochStartSpectrumDigest, taskFilePath))
+    // Generic LUT loads the topology (placement/wiring) and the data from the unified task file.
+    if (!lutMiner->initialize(randomSeed, taskFilePath))
     {
         printf("Failed to load task file '%s' for the Generic LUT miner.\n", taskFilePath);
         return -1;
