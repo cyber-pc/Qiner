@@ -7,16 +7,8 @@
 #include <cassert>
 #include <vector>
 
-// Generic LUT score engine.
-// Every neuron holds a trit and computes its next value by looking up a per-neuron table indexed
-// by the trits of its neighbour neurons; only the LUT contents change under mutation.
-//
-// Trit values are {0, 1, 2} where 0 and 1 are the two decided states and 2 means UNKNOWN.
-//
-// Scoring streams a sliding window of a time-ordered sequence into the input neurons at the
-// network's own pace (gated by a signal neuron), then settles until the signal goes UNKNOWN
-// (ready) before reading one output neuron. A window that cannot finish inside the tick budget
-// times out and fails the whole ANN.
+// Generic LUT scorer: a recurrent ternary ANN (trits {0,1,2}, 2 = UNKNOWN) predicting a windowed
+// series; only the per-neuron LUTs change under mutation.
 namespace score_generic_lut
 {
 
@@ -27,16 +19,11 @@ static constexpr unsigned long long NUMBER_OF_NEIGHBORS = 3;
 static constexpr unsigned long long NUMBER_OF_MUTATIONS = 100;
 static constexpr unsigned long long MAX_NUMBER_OF_TICKS = 256;
 
-// Max LUT entries one mutation step may use (miner-chosen L from nonce[])
 static constexpr unsigned int MAX_LUT_ENTRIES_PER_STEP = 10;
 
-// Task relate params. 
-// TODO: match this when the task file is released
-static constexpr unsigned long long SEQUENCE_LENGTH = 128;              // T, total samples
-static constexpr unsigned long long WINDOW_WIDTH = SEQUENCE_LENGTH / 2; // W
+static constexpr unsigned long long SEQUENCE_LENGTH = 128;
+static constexpr unsigned long long WINDOW_WIDTH = SEQUENCE_LENGTH / 2;
 
-// Placeholder acceptance threshold; the real threshold is epoch config.
-// TODO: remove this, we use best score
 static constexpr unsigned int SOLUTION_THRESHOLD = (unsigned int)((WINDOW_WIDTH - 1) * 4 / 5);
 
 template <
@@ -45,9 +32,9 @@ template <
     unsigned long long sequenceLength,
     unsigned long long windowWidth,
     unsigned long long maxNumberOfTicks,
-    unsigned long long numberOfNeighbors,  // LUT fan-in (neighbours read per neuron)
-    unsigned long long populationThreshold,   // P
-    unsigned long long numberOfMutations,     // S
+    unsigned long long numberOfNeighbors,
+    unsigned long long populationThreshold,
+    unsigned long long numberOfMutations,
     unsigned int solutionThreshold>
 struct Miner
 {
@@ -60,13 +47,10 @@ struct Miner
         sequenceLength * (((numberOfInputNeurons + task_file::TRITS_PER_BYTE - 1) / task_file::TRITS_PER_BYTE)
                           + ((numberOfOutputNeurons + task_file::TRITS_PER_BYTE - 1) / task_file::TRITS_PER_BYTE));
 
-    // Undecided trit (the third value); the two decided states are 0 and 1.
     static constexpr unsigned char TRIT_UNKNOWN = 2;
 
-    // Any timed-out window fails the whole ANN; this stands in for its infinite score.
     static constexpr unsigned int INFINITE_ERROR = 0xFFFFFFFFU;
 
-    // 3 trit inputs, 3^3 = 27 lines per LUT (one output trit per neighbour-trit combination).
     static constexpr unsigned long long lutSize = 27;
 
     static_assert(
@@ -84,8 +68,6 @@ struct Miner
 
     std::vector<unsigned char> poolVec;
 
-    // Init the random2 pool from the mining seed, then load the task file (topology + data).
-    // Returns false if the task file cannot be loaded or validated
     bool initialize(unsigned char* miningSeed, const char* taskFilePath)
     {
         poolVec.resize(POOL_VEC_PADDING_SIZE);
@@ -94,7 +76,7 @@ struct Miner
         return loadTaskData(taskFilePath);
     }
 
-    // Load the unified task file. Returns false on any mismatch.
+    // Load + validate the unified task file: check dims, read each block, verify its hash, parse.
     bool loadTaskData(const char* taskFilePath)
     {
         task_file::TaskFileHeader header;
@@ -115,7 +97,6 @@ struct Miner
 
         unsigned char hash[task_file::DATA_HASH_SIZE];
 
-        // Topology
         if (!task_file::readTaskFileBlock(taskFilePath, sizeof(task_file::TaskFileHeader), topoBlockBuf, topoBlockSize))
         {
             return false;
@@ -132,7 +113,6 @@ struct Miner
             return false;
         }
 
-        // Training data read, verify its hash, unpack into inputs/outputs.
         if (!task_file::readTaskFileBlock(taskFilePath, sizeof(task_file::TaskFileHeader) + topoBlockSize, dataBlockBuf, dataBlockSize))
         {
             return false;
@@ -151,7 +131,6 @@ struct Miner
         return true;
     }
 
-    // Validate the loaded topology
     bool validateTopology()
     {
         for (unsigned long long i = 0; i < numberOfInputNeurons; ++i)
@@ -173,7 +152,6 @@ struct Miner
             return false;
         }
 
-        // input, output and signal must be mutually distinct (one role per neuron).
         bool seen[populationThreshold] = {};
         for (unsigned long long i = 0; i < numberOfInputNeurons; ++i)
         {
@@ -198,7 +176,6 @@ struct Miner
         return true;
     }
 
-    // Derive neuron types (input/output/evolution) and the updated-neuron list from the placement.
     void deriveNeuronRoles()
     {
         for (unsigned long long i = 0; i < populationThreshold; ++i)
@@ -213,7 +190,6 @@ struct Miner
         {
             neuronTypes[outputNeuronIndices[i]] = Neuron::kOutput;
         }
-        // The signal neuron stays kEvolution; only its index is tracked.
 
         numberOfUpdatedNeurons = 0;
         for (unsigned long long i = 0; i < populationThreshold; ++i)
@@ -226,17 +202,13 @@ struct Miner
         }
     }
 
-    // SequenceLength samples, each numberOfInputNeurons input trits and
-    // numberOfOutputNeurons expected-output trits. 
-    // Data is {0, 1}; trit 2 stays the UNKNOWN marker.
     unsigned char inputs[sequenceLength][numberOfInputNeurons];
     unsigned char outputs[sequenceLength][numberOfOutputNeurons];
 
-    // Buffers
+    // Scratch for the two file blocks: read, hash, then parse/unpack.
     unsigned char topoBlockBuf[topoBlockSize];
     unsigned char dataBlockBuf[dataBlockSize];
 
-    // Data for running the ANN
     struct Neuron
     {
         enum Type
@@ -246,10 +218,9 @@ struct Miner
             kEvolution,
         };
         Type type;
-        unsigned char value; // trit in {0, 1, 2}
+        unsigned char value;
     };
 
-    // Data for roll back, mutation will change LUT output contents
     struct ANN
     {
         Neuron neurons[maxNumberOfNeurons];
@@ -257,37 +228,29 @@ struct Miner
     };
     ANN bestANN;
     ANN currentANN;
-    // Snapshot for the one-step rollback in the anti-attractor walk.
     ANN prevANN;
 
     struct InitValue
     {
-        unsigned char lutInit[maxNumberOfNeurons * lutSize]; // one byte per LUT line, taken mod 3
+        unsigned char lutInit[maxNumberOfNeurons * lutSize];
         unsigned long long mutationSeed[numberOfMutations * MAX_LUT_ENTRIES_PER_STEP];
     } initValue;
 
-
     unsigned char nextNeuronValue[maxNumberOfNeurons];
 
-    // Topology loaded from the task file (uint32, matching the file layout)
     uint32_t neighborOffsets[numberOfNeighbors];
 
     uint32_t inputNeuronIndices[numberOfInputNeurons];
     uint32_t outputNeuronIndices[numberOfOutputNeurons];
 
-    // One evolution neuron drives the feed handshake; it is computed and mutated like any other
-    // evolution neuron, its value is only additionally read for flow control.
     uint32_t signalNeuronIndex;
 
-    // Epoch-fixed neuron placement (input/output/evolution), derived from the loaded topology.
     Neuron::Type neuronTypes[maxNumberOfNeurons];
 
-    // Indices of all non-input neurons (output + evolution), the only ones whose LUT is used
-    // and the only ones a mutation may touch. Filled in deriveNeuronRoles().
     unsigned long long updatedNeuronIndices[maxNumberOfNeurons];
     unsigned long long numberOfUpdatedNeurons;
 
-    // Inference step, every non-input neuron looks up its next trit from the trits of its neighbours
+    // One inference tick: each non-input neuron looks up its next trit from its 3 ring neighbours.
     void processTick()
     {
         const unsigned long long population = populationThreshold;
@@ -297,18 +260,17 @@ struct Miner
         {
             if (Neuron::kInput == neurons[n].type)
             {
-                nextNeuronValue[n] = neurons[n].value; // inputs are driven externally, not here
+                nextNeuronValue[n] = neurons[n].value;
                 continue;
             }
 
-            // Ring neighbours (n + offset) mod P, then a base-3 index over their trits t0 + 3*t1 + 9*t2.
+            // Ring neighbours (n + offset) mod P; base-3 LUT index = t0 + 3*t1 + 9*t2.
             const unsigned long long t0 = neurons[(n + neighborOffsets[0]) % populationThreshold].value;
             const unsigned long long t1 = neurons[(n + neighborOffsets[1]) % populationThreshold].value;
             const unsigned long long t2 = neurons[(n + neighborOffsets[2]) % populationThreshold].value;
             nextNeuronValue[n] = currentANN.lut[n * lutSize + (t0 + 3 * t1 + 9 * t2)];
         }
 
-        // Commit the new values
         for (unsigned long long n = 0; n < population; ++n)
         {
             if (Neuron::kInput != neurons[n].type)
@@ -318,8 +280,9 @@ struct Miner
         }
     }
 
-    // Windowed self-clocked score matching the reference score(). Returns the total error count,
-    // or INFINITE_ERROR if any window times out (an ANN has failed).
+    // Sliding-window self-clocked score: feed W samples (signal-paced), settle until the signal is
+    // UNKNOWN again, then grade the output vs outputs[t+W]. A timed-out window fails the whole ANN.
+    // Returns the failure count (lower is better), or INFINITE_ERROR on timeout.
     unsigned int score()
     {
         unsigned int numberOfFailures = 0;
@@ -330,7 +293,6 @@ struct Miner
         {
             unsigned long long feedCounter = 0;
 
-            // Blank slate: every neuron UNKNOWN, so the signal starts ready.
             for (unsigned long long n = 0; n < populationThreshold; ++n)
             {
                 neurons[n].value = TRIT_UNKNOWN;
@@ -341,8 +303,7 @@ struct Miner
             {
                 if (neurons[signalNeuronIndex].value == TRIT_UNKNOWN)
                 {
-                    // Signal ready. Once the whole window is in, the output neuron holds the
-                    // prediction - stop before running another tick; otherwise drive the next sample.
+                    // Whole window is in and the signal is ready -> output is settled, read it.
                     if (feedCounter >= windowWidth)
                     {
                         break;
@@ -355,7 +316,6 @@ struct Miner
                 }
                 else
                 {
-                    // Signal not ready, drive UNKNOWN and keep computing.
                     for (unsigned long long i = 0; i < numberOfInputNeurons; ++i)
                     {
                         neurons[inputNeuronIndices[i]].value = TRIT_UNKNOWN;
@@ -365,14 +325,11 @@ struct Miner
                 processTick();
             }
 
-            // A single timed-out window fails the whole ANN; the remaining windows cannot change
-            // that, so abandon this candidate immediately.
             if (tick == maxNumberOfTicks)
             {
                 return INFINITE_ERROR;
             }
 
-            // Any mismatch is a failure - a wrong decided trit and an UNKNOWN count the same.
             const unsigned char predicted = neurons[outputNeuronIndices[0]].value;
             const unsigned char expected = outputs[trainingEntryIndex + feedCounter][0];
             if (predicted != expected)
@@ -384,14 +341,11 @@ struct Miner
         return numberOfFailures;
     }
 
-    // Rewrite a single LUT line of a single updated (non-input) neuron to a different trit.
-    //  bit 0 selects the change, and the high bits select LUT-line to change
+    // Flip one LUT entry of one non-input neuron (bit 0 picks the new trit, the rest picks the line).
     void mutate(unsigned long long mutationSeed)
     {
-        // bit 0: which of the two other trits to move to (always a change)
         const unsigned long long delta = mutationSeed & 1ULL;
 
-        // bits 1..63: which LUT line
         const unsigned long long totalLines = numberOfUpdatedNeurons * lutSize;
         const unsigned long long flatIdx = (mutationSeed >> 1) % totalLines;
         const unsigned long long neuronIdx = updatedNeuronIndices[flatIdx / lutSize];
@@ -402,19 +356,17 @@ struct Miner
         currentANN.lut[neuronIdx * lutSize + line] = newTrit;
     }
 
+    // Seed the ANN: root LUT from the pubkey alone (each computor's fixed root); mutation seeds from
+    // pubkey+nonce (nonce[0..2] are the algo/L/K knobs, excluded from the RNG). Returns the start score.
     unsigned int initializeANN(unsigned char* publicKey, unsigned char* nonce)
     {
         const unsigned long long population = populationThreshold;
         Neuron* neurons = currentANN.neurons;
 
-        // Root LUT comes from the public key
         unsigned char rootHash[32];
         KangarooTwelve(publicKey, 32, rootHash, 32);
         random2(rootHash, poolVec.data(), (unsigned char*)&initValue.lutInit, sizeof(initValue.lutInit));
 
-        // Mutation stream comes from public key + nonce, so different nonces explore different paths
-        // from that same root. K, L and the algo bit live in nonce[0..2], excluded so they do not
-        // perturb the stream.
         unsigned char searchHash[32];
         unsigned char combined[64];
         memcpy(combined, publicKey, 32);
@@ -425,14 +377,12 @@ struct Miner
         KangarooTwelve(combined, 64, searchHash, 32);
         random2(searchHash, poolVec.data(), (unsigned char*)&initValue.mutationSeed, sizeof(initValue.mutationSeed));
 
-        // Apply the epoch-fixed neuron placement
         for (unsigned long long i = 0; i < population; ++i)
         {
             neurons[i].type = neuronTypes[i];
             neurons[i].value = TRIT_UNKNOWN;
         }
 
-        // Seed every LUT line with a trit.
         for (unsigned long long n = 0; n < population; ++n)
         {
             for (unsigned long long line = 0; line < lutSize; ++line)
@@ -441,14 +391,13 @@ struct Miner
             }
         }
 
-        // Error count of the starting ANN.
         return score();
     }
 
-    // Main mining function: N mutation steps with the anti-attractor split
+    // Anti-attractor search: L mutations/step; accept worse-or-equal for the first K steps (explore),
+    // then better-or-equal (exploit); one-step rollback; keep and return the best score found.
     unsigned int computeScore(unsigned char* publicKey, unsigned char* nonce)
     {
-        // Miner knobs from nonce[1..2], do not affect the RNG.
         unsigned int L = nonce[1];
         if (L < 1)
         {
@@ -470,10 +419,8 @@ struct Miner
 
         for (unsigned long long s = 0; s < numberOfMutations; ++s)
         {
-            // Snapshot for the one-step rollback.
             memcpy(&prevANN, &currentANN, sizeof(prevANN));
 
-            // Apply L LUT-entry mutations from this step's fixed seed slot.
             for (unsigned int i = 0; i < L; ++i)
             {
                 mutate(initValue.mutationSeed[s * MAX_LUT_ENTRIES_PER_STEP + i]);
@@ -484,12 +431,10 @@ struct Miner
             bool accept = false;
             if (s < K)
             {
-                // First K steps, keep the mutation if it made the score worse (or equal).
                 accept = (r >= cur);
             }
             else
             {
-                // Then, keep the mutation if it made the score better (or equal).
                 accept = (r <= cur);
             }
 
@@ -499,7 +444,6 @@ struct Miner
             }
             else
             {
-                // Roll back one step (to the previous position, NOT to the best).
                 memcpy(&currentANN, &prevANN, sizeof(currentANN));
             }
 
@@ -524,4 +468,4 @@ struct Miner
     }
 };
 
-} // namespace score_generic_lut
+}
