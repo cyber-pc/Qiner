@@ -6,9 +6,9 @@
 // Fixed-width fields use plain types (unsigned int = 32-bit, unsigned long long = 64-bit).
 //
 // Topology block (all unsigned int, native little-endian):
-//   inputNeuronIndices[N], outputNeuronIndices[M], signalNeuronIndex, neighborOffsets[K].
-// The wiring is a ring: neuron n's k-th neighbour is (n + neighborOffsets[k]) mod P - the same K
-// offsets for every neuron, so only K values are stored instead of P*K.
+//   inputNeuronIndices[N], outputNeuronIndices[M], signalNeuronIndex, neighborIndices[P*K].
+// Wiring is explicit per neuron: neuron n's k-th neighbour is neighborIndices[n*K + k], any neuron in
+// [0, P). Each neuron may choose its own arbitrary set of K neighbours.
 // Data block: numPairs rows, each row = ceil(N/5) packed input bytes + ceil(M/5) packed output bytes.
 // Trits are packed five per byte: t0 + 3*t1 + 9*t2 + 27*t3 + 81*t4, so a valid byte is 0..242.
 namespace task_file
@@ -69,10 +69,10 @@ inline unsigned long long packedBytes(unsigned long long tritCount)
 }
 
 // Byte length of the topology block: inputNeuronIndices[N], outputNeuronIndices[M], one signal index,
-// and neighborOffsets[K] - all unsigned int.
-inline unsigned long long topologyBytes(unsigned int numInputTrits, unsigned int numOutputTrits, unsigned int numNeighbors)
+// and neighborIndices[population*K] - all unsigned int.
+inline unsigned long long topologyBytes(unsigned int numInputTrits, unsigned int numOutputTrits, unsigned int population, unsigned int numNeighbors)
 {
-    return ((unsigned long long)numInputTrits + numOutputTrits + 1 + numNeighbors) * sizeof(unsigned int);
+    return ((unsigned long long)numInputTrits + numOutputTrits + 1 + (unsigned long long)population * numNeighbors) * sizeof(unsigned int);
 }
 
 // Byte length of the packed data block.
@@ -125,11 +125,11 @@ inline bool unpackTrits(const unsigned char* bytes, unsigned long long count, un
     return true;
 }
 
-// Serialise the topology into outBlock (topologyBytes long): input, output, signal, then the K
-// ring offsets (same for every neuron).
-inline void serializeTopologyBlock(unsigned int numInputTrits, unsigned int numOutputTrits, unsigned int numNeighbors,
+// Serialise the topology into outBlock (topologyBytes long): input, output, signal, then the explicit
+// per-neuron neighbour indices (population * K).
+inline void serializeTopologyBlock(unsigned int numInputTrits, unsigned int numOutputTrits, unsigned int population, unsigned int numNeighbors,
                                    const unsigned int* inputNeuronIndices, const unsigned int* outputNeuronIndices,
-                                   unsigned int signalNeuronIndex, const unsigned int* neighborOffsets,
+                                   unsigned int signalNeuronIndex, const unsigned int* neighborIndices,
                                    unsigned char* outBlock)
 {
     unsigned char* p = outBlock;
@@ -139,13 +139,13 @@ inline void serializeTopologyBlock(unsigned int numInputTrits, unsigned int numO
     p += (unsigned long long)numOutputTrits * sizeof(unsigned int);
     copyBytes(p, (const unsigned char*)&signalNeuronIndex, sizeof(unsigned int));
     p += sizeof(unsigned int);
-    copyBytes(p, (const unsigned char*)neighborOffsets, (unsigned long long)numNeighbors * sizeof(unsigned int));
+    copyBytes(p, (const unsigned char*)neighborIndices, (unsigned long long)population * numNeighbors * sizeof(unsigned int));
 }
 
 // Parse a topology block (as read from the file) into the caller's arrays. Inverse of serialize.
-inline void parseTopologyBlock(const unsigned char* block, unsigned int numInputTrits, unsigned int numOutputTrits, unsigned int numNeighbors,
+inline void parseTopologyBlock(const unsigned char* block, unsigned int numInputTrits, unsigned int numOutputTrits, unsigned int population, unsigned int numNeighbors,
                                unsigned int* outInputNeuronIndices, unsigned int* outOutputNeuronIndices,
-                               unsigned int* outSignalNeuronIndex, unsigned int* outNeighborOffsets)
+                               unsigned int* outSignalNeuronIndex, unsigned int* outNeighborIndices)
 {
     const unsigned char* p = block;
     copyBytes((unsigned char*)outInputNeuronIndices, p, (unsigned long long)numInputTrits * sizeof(unsigned int));
@@ -154,7 +154,7 @@ inline void parseTopologyBlock(const unsigned char* block, unsigned int numInput
     p += (unsigned long long)numOutputTrits * sizeof(unsigned int);
     copyBytes((unsigned char*)outSignalNeuronIndex, p, sizeof(unsigned int));
     p += sizeof(unsigned int);
-    copyBytes((unsigned char*)outNeighborOffsets, p, (unsigned long long)numNeighbors * sizeof(unsigned int));
+    copyBytes((unsigned char*)outNeighborIndices, p, (unsigned long long)population * numNeighbors * sizeof(unsigned int));
 }
 
 // Pack numPairs input/output trit rows into outBlock (dataBytes long), row-major.

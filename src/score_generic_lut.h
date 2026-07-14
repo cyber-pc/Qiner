@@ -42,7 +42,7 @@ struct Miner
     static constexpr unsigned long long numberOfWindows = sequenceLength - windowWidth;
 
     static constexpr unsigned long long topoBlockSize =
-        (numberOfInputNeurons + numberOfOutputNeurons + 1 + numberOfNeighbors) * sizeof(uint32_t);
+        (numberOfInputNeurons + numberOfOutputNeurons + 1 + populationThreshold * numberOfNeighbors) * sizeof(uint32_t);
     static constexpr unsigned long long dataBlockSize =
         sequenceLength * (((numberOfInputNeurons + task_file::TRITS_PER_BYTE - 1) / task_file::TRITS_PER_BYTE)
                           + ((numberOfOutputNeurons + task_file::TRITS_PER_BYTE - 1) / task_file::TRITS_PER_BYTE));
@@ -106,8 +106,8 @@ struct Miner
         {
             return false;
         }
-        task_file::parseTopologyBlock(topoBlockBuf, numberOfInputNeurons, numberOfOutputNeurons, numberOfNeighbors,
-                                      inputNeuronIndices, outputNeuronIndices, &signalNeuronIndex, neighborOffsets);
+        task_file::parseTopologyBlock(topoBlockBuf, numberOfInputNeurons, numberOfOutputNeurons, populationThreshold, numberOfNeighbors,
+                                      inputNeuronIndices, outputNeuronIndices, &signalNeuronIndex, neighborIndices);
         if (!validateTopology())
         {
             return false;
@@ -172,6 +172,14 @@ struct Miner
         if (seen[signalNeuronIndex])
         {
             return false;
+        }
+
+        for (unsigned long long i = 0; i < populationThreshold * numberOfNeighbors; ++i)
+        {
+            if (neighborIndices[i] >= populationThreshold)
+            {
+                return false;
+            }
         }
         return true;
     }
@@ -238,7 +246,7 @@ struct Miner
 
     unsigned char nextNeuronValue[maxNumberOfNeurons];
 
-    uint32_t neighborOffsets[numberOfNeighbors];
+    uint32_t neighborIndices[populationThreshold * numberOfNeighbors];
 
     uint32_t inputNeuronIndices[numberOfInputNeurons];
     uint32_t outputNeuronIndices[numberOfOutputNeurons];
@@ -250,7 +258,7 @@ struct Miner
     unsigned long long updatedNeuronIndices[maxNumberOfNeurons];
     unsigned long long numberOfUpdatedNeurons;
 
-    // One inference tick: each non-input neuron looks up its next trit from its 3 ring neighbours.
+    // One inference tick: each non-input neuron looks up its next trit from its 3 neighbours.
     void processTick()
     {
         const unsigned long long population = populationThreshold;
@@ -264,10 +272,10 @@ struct Miner
                 continue;
             }
 
-            // Ring neighbours (n + offset) mod P; base-3 LUT index = t0 + 3*t1 + 9*t2.
-            const unsigned long long t0 = neurons[(n + neighborOffsets[0]) % populationThreshold].value;
-            const unsigned long long t1 = neurons[(n + neighborOffsets[1]) % populationThreshold].value;
-            const unsigned long long t2 = neurons[(n + neighborOffsets[2]) % populationThreshold].value;
+            // Explicit per-neuron neighbours; base-3 LUT index = t0 + 3*t1 + 9*t2.
+            const unsigned long long t0 = neurons[neighborIndices[n * numberOfNeighbors + 0]].value;
+            const unsigned long long t1 = neurons[neighborIndices[n * numberOfNeighbors + 1]].value;
+            const unsigned long long t2 = neurons[neighborIndices[n * numberOfNeighbors + 2]].value;
             nextNeuronValue[n] = currentANN.lut[n * lutSize + (t0 + 3 * t1 + 9 * t2)];
         }
 
