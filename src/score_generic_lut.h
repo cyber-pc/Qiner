@@ -17,14 +17,15 @@ static constexpr unsigned long long NUMBER_OF_OUTPUT_NEURONS = 1;
 static constexpr unsigned long long POPULATION_THRESHOLD = 256;
 static constexpr unsigned long long NUMBER_OF_NEIGHBORS = 3;
 static constexpr unsigned long long NUMBER_OF_MUTATIONS = 100;
-static constexpr unsigned long long MAX_NUMBER_OF_TICKS = 256;
+static constexpr unsigned long long MAX_NUMBER_OF_TICKS = 10000;
 
 static constexpr unsigned int MAX_LUT_ENTRIES_PER_STEP = 10;
+static constexpr unsigned long long SEQUENCE_LENGTH = 24 * 365;
+static constexpr unsigned long long WINDOW_WIDTH = 24 * 28;
 
-static constexpr unsigned long long SEQUENCE_LENGTH = 128;
-static constexpr unsigned long long WINDOW_WIDTH = SEQUENCE_LENGTH / 2;
-
-static constexpr unsigned int SOLUTION_THRESHOLD = (unsigned int)((WINDOW_WIDTH - 1) * 4 / 5);
+// Placeholder,
+// TODO: adjust this later
+static constexpr unsigned int SOLUTION_THRESHOLD = (unsigned int)(((SEQUENCE_LENGTH - WINDOW_WIDTH) - 1) * 4 / 5);
 
 template <
     unsigned long long numberOfInputNeurons,
@@ -65,6 +66,12 @@ struct Miner
     static_assert(
         windowWidth >= 2 && windowWidth < sequenceLength,
         "windowWidth must be at least 2 and leave room for the target after the window");
+    static_assert(
+        numberOfOutputNeurons == 1,
+        "score() grades only output neuron 0");
+    static_assert(
+        maxNumberOfTicks > windowWidth,
+        "maxNumberOfTicks must exceed windowWidth so a window can be fully fed before timing out");
 
     std::vector<unsigned char> poolVec;
 
